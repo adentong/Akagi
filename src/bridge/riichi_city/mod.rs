@@ -4,14 +4,16 @@
 //! over WebSocket. Gameplay messages carry a string `"cmd"` discriminator
 //! inside the JSON (`cmd_enter_room`, `cmd_game_start`, `cmd_game_action_brc`,
 //! …); the binary `cmd` field only matters for `CMDAuth`, which carries our
-//! `uid`. See [`packet`] for the framing and [`consts`] for the tile table.
+//! `uid` and the lobby `sid`. See [`packet`] for the framing and [`consts`]
+//! for the tile table.
 //!
 //! Rust port of the observation half of the Akagi v2 Python Riichi City
 //! bridge, extended with the uplink half autoplay needs: [`build`](Bridge::build)
-//! encodes our actions as client frames injected onto the gameplay socket.
-//! Both wire directions are parsed (the `CMDAuth` packet is client→server
-//! while gameplay broadcasts are server→client; client request frames don't
-//! match any server `cmd_*` and fall through).
+//! encodes our actions as client frames, and `parse` lifts the auth `sid`
+//! and every queue push onto the inject bus for the lobby HTTP client
+//! ([`lobby`]). Both wire directions are parsed (the `CMDAuth` packet is
+//! client→server while gameplay broadcasts are server→client; client
+//! request frames don't match any server `cmd_*` and fall through).
 //!
 //! Two intentional improvements over v2:
 //! - **Sanma** events use the native length 3 (no ghost-padding to 4); actor
@@ -30,7 +32,9 @@
 
 pub mod build;
 pub mod consts;
+pub mod lobby;
 pub mod packet;
+pub mod restore;
 pub mod state;
 
 use super::{Bridge, Direction, ParseResult};
@@ -45,7 +49,7 @@ use packet::{WPacket, CMD_AUTH};
 use serde_json::Value as JsonValue;
 use state::GameStatus;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const LOG: &str = "akagi::bridge::riichi_city";
 
@@ -62,6 +66,11 @@ pub struct RiichiCityBridge {
     /// connection is inside a game, so injected gameplay frames only ride
     /// the WS flow that is actually carrying one.
     inject: Option<crate::autoplay::inject::SharedInjectBus>,
+    /// Set by a state restore that synthesized our pending draw: the next
+    /// `cmd_send_current_action` window re-offer delivers the same draw
+    /// again, and its tsumo event must be swallowed (the tracker already
+    /// has the tile).
+    suppress_own_tsumo: bool,
 }
 
 impl RiichiCityBridge {
@@ -73,6 +82,7 @@ impl RiichiCityBridge {
             session,
             mjai_log: None,
             inject: None,
+            suppress_own_tsumo: false,
         }
     }
 
@@ -113,11 +123,30 @@ impl RiichiCityBridge {
     }
 
     fn dispatch(&mut self, pkt: &WPacket) -> Vec<MjaiEvent> {
-        // The binary auth handshake (client → server) carries our uid.
+        // The binary auth handshake (client → server) carries our uid and
+        // the `sid` the lobby HTTP API authenticates with.
         if pkt.cmd == CMD_AUTH {
             if let Some(uid) = pkt.body.get("uid").and_then(json_i64) {
                 self.uid = uid;
                 info!(target: LOG, "captured player uid from auth");
+            }
+            if let Some(inject) = &self.inject {
+                if let Some(sid) = pkt.body.get("sid").and_then(JsonValue::as_str) {
+                    let field = |k: &str| {
+                        pkt.body
+                            .get(k)
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    inject.note_lobby_credentials(crate::autoplay::inject::LobbyCredentials {
+                        sid: sid.to_string(),
+                        lang: field("lang"),
+                        platform: field("platform"),
+                        version: field("version"),
+                    });
+                    info!(target: LOG, "captured lobby sid from auth");
+                }
             }
             return Vec::new();
         }
@@ -129,9 +158,44 @@ impl RiichiCityBridge {
         // closed by anything that resolves play.
         if let Some(inject) = &self.inject {
             match cmd {
-                "cmd_send_current_action" | "cmd_send_other_action" => inject.note_window(),
-                "cmd_game_action_brc" | "cmd_game_end" | "cmd_room_end" | "cmd_game_start" => {
+                "cmd_send_current_action" => inject.note_window(true),
+                "cmd_send_other_action" => inject.note_window(false),
+                "cmd_game_action_brc" => {
+                    // While OUR own-turn window is open no other player can
+                    // legally act — a broadcast by anyone else here is an
+                    // out-of-order re-broadcast (observed live after a
+                    // reconnect: a stale discard from another point in the
+                    // game arrived mid-window, closed our window, and the
+                    // turn timed out). Drop the whole frame: the window
+                    // stays open and the tracker is spared the phantom.
+                    if inject.window_is_open()
+                        && inject.window_is_own_turn()
+                        && brc_actor_uid_of(data) != Some(self.uid)
+                    {
+                        warn!(
+                            target: LOG,
+                            "out-of-order cmd_game_action_brc during our window; dropped"
+                        );
+                        return Vec::new();
+                    }
                     inject.note_window_closed()
+                }
+                "cmd_game_end" | "cmd_room_end" | "cmd_game_start" => inject.note_window_closed(),
+                // Queue push: the matchID is what cancelStage needs.
+                "cmd_stagematch_run" => {
+                    let classify = data
+                        .and_then(|d| d.get("classifyID"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let match_id = data
+                        .and_then(|d| d.get("matchID"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if !classify.is_empty() && !match_id.is_empty() {
+                        inject.note_queue_state(classify, match_id);
+                    }
                 }
                 _ => {}
             }
@@ -217,9 +281,85 @@ impl RiichiCityBridge {
                 }
             }
         }
+        // Mid-game reconnect: the running hand's `cmd_game_start` never
+        // arrives on this connection, so the rotation and our seat must be
+        // resolved here or every event — our own decision windows included
+        // — is attributed to the wrong actor (observed live: our window
+        // tagged `seat 0`, the default, and autoplay went blind). The
+        // payload carries everything the first `cmd_game_start` uses: the
+        // roster plus `initial_dealer_pos`, the first hand's East dealer —
+        // the client does exactly this from this same message
+        // (`GameParam.FirstBanker = initial_dealer_pos + 1`, "根据第一局的
+        // 东家 确定座位").
+        if data.get("is_reconnect").and_then(JsonValue::as_bool) == Some(true)
+            && !status.player_list.is_empty()
+        {
+            let dealer = field_i64(data, "initial_dealer_pos").unwrap_or(0);
+            let mid = dealer.rem_euclid(status.player_list.len() as i64) as usize;
+            status.player_list.rotate_left(mid);
+            let seat = status
+                .player_list
+                .iter()
+                .position(|&id| id == self.uid)
+                .unwrap_or_else(|| {
+                    warn!(target: LOG, "reconnect: our uid not in player_list; defaulting seat 0");
+                    0
+                }) as u8;
+            info!(target: LOG, "reconnect: resolved seat {seat} from initial_dealer_pos {dealer}");
+            status.seat = seat;
+            status.shift = dealer;
+            status.seat_resolved = true;
+            // Mid-hand (`hand_status` present): the game is already running
+            // and the tracker holds its state from the original connection,
+            // so the next kyoku boundary must NOT emit a second
+            // `start_game`. Pre-deal reconnects (`hand_status` null) leave
+            // the flag set — that `start_game` is still owed.
+            let mid_hand = data.get("hand_status").is_some_and(|h| !h.is_null());
+            if mid_hand {
+                status.game_start = false;
+            }
+        }
         self.status = status;
         if let Some(inject) = &self.inject {
             inject.set_in_game(true);
+            // The dead connection's open window is void — its timer was
+            // burning against a socket nobody read. Clear it so plans
+            // can't fire into a stale identity; the server re-offers the
+            // window (if the turn survives) right after this frame.
+            inject.note_window_closed();
+        }
+        // Mid-hand reconnects additionally rebuild the tracker's state
+        // from the snapshot — the disconnect gap's events (melds, riichi,
+        // rivers, dora, scores) were broadcast to a dead socket and are
+        // otherwise lost. A refused restore falls back to continuing on
+        // the stale state rather than dropping the connection's events.
+        if data.get("is_reconnect").and_then(JsonValue::as_bool) == Some(true)
+            && data.get("hand_status").is_some_and(|h| !h.is_null())
+        {
+            return match restore::synthesise(data, &self.status) {
+                Ok(outcome) => {
+                    info!(
+                        target: LOG,
+                        events = outcome.events.len(),
+                        "reconnect: restored game state from snapshot"
+                    );
+                    if outcome.own_pending_draw {
+                        // The synthesized stream already delivered our draw;
+                        // swallow the duplicate when the server re-offers
+                        // the window (see `on_send_current_action`).
+                        self.suppress_own_tsumo = true;
+                        self.status.drawn_by = Some(self.status.seat);
+                    }
+                    outcome.events
+                }
+                Err(reason) => {
+                    warn!(
+                        target: LOG,
+                        "reconnect: state restore refused ({reason}); continuing with stale state"
+                    );
+                    Vec::new()
+                }
+            };
         }
         Vec::new()
     }
@@ -235,22 +375,28 @@ impl RiichiCityBridge {
         let n = self.status.num_players as i64;
 
         if self.status.game_start {
-            // Rotate enter-room order so index 0 is the first dealer.
-            if !self.status.player_list.is_empty() {
-                let mid = dealer_pos.rem_euclid(self.status.player_list.len() as i64) as usize;
-                self.status.player_list.rotate_left(mid);
+            // Rotate enter-room order so index 0 is the first dealer —
+            // unless a reconnect already did (seat_resolved); re-rotating
+            // the rotated list would shift every actor.
+            if !self.status.seat_resolved {
+                if !self.status.player_list.is_empty() {
+                    let mid = dealer_pos.rem_euclid(self.status.player_list.len() as i64) as usize;
+                    self.status.player_list.rotate_left(mid);
+                }
+                let seat = self
+                    .status
+                    .player_list
+                    .iter()
+                    .position(|&id| id == self.uid)
+                    .unwrap_or_else(|| {
+                        warn!(target: LOG, "our uid not found in player_list; defaulting seat 0");
+                        0
+                    }) as u8;
+                self.status.seat = seat;
+                self.status.shift = dealer_pos;
+                self.status.seat_resolved = true;
             }
-            let seat = self
-                .status
-                .player_list
-                .iter()
-                .position(|&id| id == self.uid)
-                .unwrap_or_else(|| {
-                    warn!(target: LOG, "our uid not found in player_list; defaulting seat 0");
-                    0
-                }) as u8;
-            self.status.seat = seat;
-            self.status.shift = dealer_pos;
+            let seat = self.status.seat;
             self.rotate_mjai_log();
             // Display names in mjai-actor order (player_list is already
             // dealer-rotated). A missing nickname becomes "" so the frontend
@@ -394,6 +540,26 @@ impl RiichiCityBridge {
         let pai = field_card(data, "in_card");
         if pai != "?" {
             self.status.drawn_by = Some(self.status.seat);
+            // A live draw of ours supersedes any in-flight plan for an
+            // earlier decision (see `InjectBus::note_own_draw`) — unless
+            // the restore already delivered this exact draw, in which
+            // case emitting it again would double-count the tile into
+            // the tracked hand. The window itself was still noted by
+            // `dispatch`, so autoplay's plans are unaffected.
+            if self.suppress_own_tsumo {
+                self.suppress_own_tsumo = false;
+                debug!(target: LOG, "suppressed duplicate own tsumo after restore");
+                return events;
+            }
+            if let Some(inject) = &self.inject {
+                // The offer carries the turn's remaining server budget;
+                // after a reconnect it comes back with the variable part
+                // already burned to zero (the timer ticks through the
+                // dead period), so autoplay must plan inside it.
+                let fixed = field_i64(data, "oper_fixed_time").unwrap_or(5).max(0) as u32;
+                let var = field_i64(data, "oper_var_time").unwrap_or(20).max(0) as u32;
+                inject.note_own_draw((fixed + var) * 1000);
+            }
             events.push(MjaiEvent::Tsumo {
                 actor: self.status.seat,
                 pai,
@@ -747,6 +913,18 @@ fn json_i64(v: &JsonValue) -> Option<i64> {
     v.as_str().and_then(|s| s.parse::<i64>().ok())
 }
 
+/// The acting `user_id` of a `cmd_game_action_brc`'s first entry (its
+/// `user_id` names who performed the action; `last_action_user_id` is
+/// the previous actor).
+fn brc_actor_uid_of(data: Option<&JsonValue>) -> Option<i64> {
+    data?
+        .get("action_info")?
+        .as_array()?
+        .first()?
+        .get("user_id")
+        .and_then(json_i64)
+}
+
 fn field_i64(data: &JsonValue, key: &str) -> Option<i64> {
     data.get(key).and_then(json_i64)
 }
@@ -820,6 +998,88 @@ mod tests {
 
     fn auth(b: &mut RiichiCityBridge) {
         feed(b, CMD_AUTH, json!({ "uid": ME.to_string() }));
+    }
+
+    /// The auth frame's sid (plus the client meta) must be lifted onto the
+    /// inject bus — it is what the lobby HTTP API authenticates with.
+    #[test]
+    fn auth_frame_lifts_lobby_credentials() {
+        let inject = std::sync::Arc::new(crate::autoplay::inject::InjectBus::new());
+        let mut bridge = RiichiCityBridge::new(None, None).with_inject(Some(inject.clone()));
+
+        assert!(inject.lobby_credentials().is_none(), "nothing before auth");
+        feed(
+            &mut bridge,
+            CMD_AUTH,
+            json!({
+                "uid": ME.to_string(),
+                "sid": "da3p6g8h8t2s5j53ggs03740f8",
+                "lang": "en",
+                "platform": "pc",
+                "version": "2.2.4.95474",
+            }),
+        );
+        let creds = inject
+            .lobby_credentials()
+            .expect("sid captured from the auth frame");
+        assert_eq!(creds.sid, "da3p6g8h8t2s5j53ggs03740f8");
+        assert_eq!(creds.lang, "en");
+        assert_eq!(creds.platform, "pc");
+        assert_eq!(creds.version, "2.2.4.95474");
+    }
+
+    /// Every `cmd_stagematch_run` push must land on the inject bus — the
+    /// matchIDs are what `cancelStage` needs to leave the queues, and the
+    /// galaxy + sun fallback runs two at once.
+    #[test]
+    fn stagematch_run_lands_on_the_inject_bus() {
+        let inject = std::sync::Arc::new(crate::autoplay::inject::InjectBus::new());
+        let mut bridge = RiichiCityBridge::new(None, None).with_inject(Some(inject.clone()));
+
+        assert!(inject.queue_states().is_empty());
+        feed(
+            &mut bridge,
+            0,
+            json!({
+                "cmd": "cmd_stagematch_run",
+                "data": {
+                    "classifyID": "bvgn113gm5c5il7c48rg7",
+                    "matchID": "da26fvro1kn6d935usfg",
+                    "round": 1,
+                    "stageType": 4,
+                },
+            }),
+        );
+        // A second, concurrent queue (the sun fallback) is tracked
+        // alongside, not instead of, the first.
+        feed(
+            &mut bridge,
+            0,
+            json!({
+                "cmd": "cmd_stagematch_run",
+                "data": {
+                    "classifyID": "bvgn113gm5c5il7c48rg5",
+                    "matchID": "da77sunqueue000000000",
+                    "round": 1,
+                    "stageType": 3,
+                },
+            }),
+        );
+        let mut queues = inject.queue_states();
+        queues.sort();
+        assert_eq!(
+            queues,
+            vec![
+                (
+                    "bvgn113gm5c5il7c48rg5".to_string(),
+                    "da77sunqueue000000000".to_string()
+                ),
+                (
+                    "bvgn113gm5c5il7c48rg7".to_string(),
+                    "da26fvro1kn6d935usfg".to_string()
+                ),
+            ]
+        );
     }
 
     /// Every rsp_game_action must bump the ack counter autoplay verifies
@@ -958,6 +1218,160 @@ mod tests {
             b.status.nicknames.get(&1001).map(String::as_str),
             Some("alice")
         );
+    }
+
+    /// A mid-game reconnect payload (from a live 2026-08-24 capture,
+    /// ids/nicks swapped for fakes): `is_reconnect: true`, the same roster
+    /// as the original table, `initial_dealer_pos` = the first hand's
+    /// East dealer in roster order, and a non-null `hand_status` marking
+    /// the running hand.
+    fn reconnect_room(b: &mut RiichiCityBridge, hand_status: Value) {
+        feed(
+            b,
+            18,
+            json!({
+                "cmd": "cmd_enter_room",
+                "room_id": "reconnecttoken1",
+                "data": {
+                    "is_reconnect": true,
+                    "initial_dealer_pos": 2,
+                    "hand_status": hand_status,
+                    "action_info": { "current_user_id": 1004, "current_action": null },
+                    "options": {
+                        "classify_id": "classifytoken0001",
+                        "player_count": 4,
+                        "stage_type": 1,
+                        "game_play": 1001
+                    },
+                    "players": [
+                        {"user": {"user_id": 1001, "nickname": "alice"}},
+                        {"user": {"user_id": 1002, "nickname": "bob"}},
+                        {"user": {"user_id": 1003, "nickname": "carol"}},
+                        {"user": {"user_id": 1004, "nickname": "dave"}}
+                    ]
+                }
+            }),
+        );
+    }
+
+    /// The live incident: after a mid-game reconnect, our own decision
+    /// window was attributed to the default `seat 0` — the tracker still
+    /// believed our seat was the one from the original connection, so the
+    /// bot was never asked and autoplay went blind for the rest of the
+    /// game. The reconnect enter_room must resolve the rotation and seat
+    /// itself, because the running hand's `cmd_game_start` never arrives.
+    #[test]
+    fn mid_hand_reconnect_resolves_seat_for_our_windows() {
+        let mut b = RiichiCityBridge::new(None, None);
+        auth(&mut b);
+        reconnect_room(&mut b, json!({ "ben_chang_num": 0, "chang_ci": 2 }));
+        // Roster [1001,1002,1003,1004] rotated left by 2 → actor order
+        // [1003,1004,1001,1002]; our uid 1001 lands at seat 2.
+        assert_eq!(b.status.seat, 2);
+        assert!(b.status.seat_resolved);
+        assert_eq!(b.status.shift, 2);
+        assert!(!b.status.game_start, "mid-hand: start_game is not owed");
+        assert_eq!(b.status.actor_of(1003), Some(0));
+        assert_eq!(b.status.actor_of(1001), Some(2));
+
+        // Our own draw prompt lands on the right actor — pre-fix this was
+        // `actor: 0` and the bot never saw a decision for its seat.
+        let events = feed(
+            &mut b,
+            18,
+            json!({
+                "cmd": "cmd_send_current_action",
+                "data": { "in_card": 0x11, "is_nine_cards": false }
+            }),
+        );
+        assert!(matches!(
+            &events[..],
+            [MjaiEvent::Tsumo { actor: 2, pai }] if pai == "1s"
+        ));
+    }
+
+    /// Mid-hand reconnect: the next kyoku boundary must NOT emit a second
+    /// `start_game` (the tracker holds the game from the original
+    /// connection), but the round math must stay correct through the
+    /// reconnect-resolved `shift`.
+    #[test]
+    fn mid_hand_reconnect_next_kyoku_has_no_start_game_and_correct_oya() {
+        let mut b = RiichiCityBridge::new(None, None);
+        auth(&mut b);
+        reconnect_room(&mut b, json!({ "ben_chang_num": 0, "chang_ci": 2 }));
+        // East-2: dealer_pos 3 (roster coords) with shift 2 → oya 1.
+        let events = feed(
+            &mut b,
+            18,
+            json!({
+                "cmd": "cmd_game_start",
+                "data": {
+                    "quan_feng": 0x31, "bao_pai_card": 0x21, "dealer_pos": 3,
+                    "ben_chang_num": 0, "li_zhi_bang_num": 0,
+                    "user_info_list": [
+                        {"user_id": 1001, "hand_points": 25000},
+                        {"user_id": 1002, "hand_points": 25000},
+                        {"user_id": 1003, "hand_points": 25000},
+                        {"user_id": 1004, "hand_points": 25000}
+                    ],
+                    "hand_cards": [0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x01,0x02,0x03,0x04]
+                }
+            }),
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, MjaiEvent::StartGame { .. })),
+            "the tracker already holds this game's start_game"
+        );
+        let kyoku = events.iter().find_map(|e| match e {
+            MjaiEvent::StartKyoku { oya, .. } => Some(*oya),
+            _ => None,
+        });
+        assert_eq!(kyoku, Some(1), "East-2 dealer is actor 1 via shift 2");
+    }
+
+    /// Pre-deal reconnect (`hand_status` null — e.g. during the ready
+    /// countdown): the coming `cmd_game_start` still owes a `start_game`
+    /// (this connection's tracker has nothing), using the seat the
+    /// reconnect already resolved — and must not re-rotate the rotated
+    /// roster.
+    #[test]
+    fn pre_deal_reconnect_still_emits_start_game_without_double_rotation() {
+        let mut b = RiichiCityBridge::new(None, None);
+        auth(&mut b);
+        reconnect_room(&mut b, Value::Null);
+        assert!(b.status.game_start, "start_game still owed");
+        assert_eq!(b.status.seat, 2);
+        let events = feed(
+            &mut b,
+            18,
+            json!({
+                "cmd": "cmd_game_start",
+                "data": {
+                    "quan_feng": 0x31, "bao_pai_card": 0x21, "dealer_pos": 2,
+                    "ben_chang_num": 0, "li_zhi_bang_num": 0,
+                    "user_info_list": [
+                        {"user_id": 1001, "hand_points": 25000},
+                        {"user_id": 1002, "hand_points": 25000},
+                        {"user_id": 1003, "hand_points": 25000},
+                        {"user_id": 1004, "hand_points": 25000}
+                    ],
+                    "hand_cards": [0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x01,0x02,0x03,0x04]
+                }
+            }),
+        );
+        match events.iter().find_map(|e| match e {
+            MjaiEvent::StartGame { names, id, .. } => Some((names.clone(), *id)),
+            _ => None,
+        }) {
+            Some((names, id)) => {
+                assert_eq!(id, Some(2));
+                // Rotated actor order, not re-rotated.
+                assert_eq!(names, vec!["carol", "dave", "alice", "bob"]);
+            }
+            None => panic!("pre-deal reconnect still owes a start_game"),
+        }
     }
 
     #[test]

@@ -570,6 +570,7 @@ impl BotRunner for NativeBot {
             return Ok(BotResponse {
                 action: MjaiEvent::None,
                 meta: None,
+                own_tsumo_seq: None,
             });
         }
 
@@ -581,6 +582,7 @@ impl BotRunner for NativeBot {
                 return Ok(BotResponse {
                     action: MjaiEvent::None,
                     meta: None,
+                    own_tsumo_seq: None,
                 })
             }
         };
@@ -600,7 +602,11 @@ impl BotRunner for NativeBot {
         } else {
             local_reply(&local, self.seat)
         };
-        Ok(BotResponse { action, meta })
+        Ok(BotResponse {
+            action,
+            meta,
+            own_tsumo_seq: None,
+        })
     }
 
     async fn reset(&mut self) -> Result<()> {
