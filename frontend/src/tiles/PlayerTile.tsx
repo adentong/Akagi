@@ -2,7 +2,8 @@ import { useTranslation } from 'react-i18next'
 import { TileFrame } from '@/components/TileFrame'
 import { Mahgen } from '@/components/Mahgen'
 import { useGameStore } from '@/stores/gameStore'
-import { fmtScore, relativeKind, bakazeFor } from '@/lib/format'
+import { fmtScore, bakazeFor } from '@/lib/format'
+import { playerTileTitle } from '@/tiles/playerTitle'
 import type { Breakpoint, TileId } from '@/tiles/defaults'
 
 const SEAT_TO_TILE: Record<number, TileId> = {
@@ -10,13 +11,6 @@ const SEAT_TO_TILE: Record<number, TileId> = {
   1: 'player-1',
   2: 'player-2',
   3: 'player-3',
-}
-
-const KIND_TKEY: Record<string, string> = {
-  self: 'mahjong.self',
-  shimocha: 'mahjong.shimocha',
-  toimen: 'mahjong.toimen',
-  kamicha: 'mahjong.kamicha',
 }
 
 export function PlayerTile({ seat, bp }: { seat: number; bp: Breakpoint }) {
@@ -27,12 +21,13 @@ export function PlayerTile({ seat, bp }: { seat: number; bp: Breakpoint }) {
   const player = game?.players[seat]
   const playerView = view?.players[seat]
   const ourSeat = game?.our_seat ?? null
-  const kind = relativeKind(seat, ourSeat, numPlayers)
-  const isSelf = kind === 'self'
   const id = SEAT_TO_TILE[seat]
-  const title = isSelf
-    ? t('tile.player_n_self', { n: seat + 1 })
-    : t('tile.player_n', { n: seat + 1 })
+  const title = playerTileTitle(t, seat, ourSeat, numPlayers)
+  // The title is seat-relative, so keep the absolute seat number visible in
+  // the header for cross-referencing (hidden when it would duplicate the
+  // "Player N" fallback title).
+  const seatBadge =
+    ourSeat != null ? t('tile.player_n', { n: seat + 1 }) : null
 
   // bakaze of this seat (E/S/W rotates from oya in 3p; E/S/W/N in 4p)
   const seatWind = game ? bakazeFor(seat, game.oya, numPlayers) : '—'
@@ -44,9 +39,11 @@ export function PlayerTile({ seat, bp }: { seat: number; bp: Breakpoint }) {
       title={title}
       bp={bp}
       rightSlot={
-        <span className="text-[10px] uppercase tracking-wider text-muted-foreground px-1">
-          {t(KIND_TKEY[kind])}
-        </span>
+        seatBadge && (
+          <span className="text-[10px] uppercase tracking-wider text-muted-foreground px-1">
+            {seatBadge}
+          </span>
+        )
       }
       contentClassName="flex flex-col gap-2"
     >

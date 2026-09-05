@@ -204,22 +204,3 @@ export const DEFAULT_LAYOUTS_3P: Record<Breakpoint, LayoutItem[]> = {
 
 /** 3p hides player-3 (no fourth player). */
 export const DEFAULT_HIDDEN_3P: TileId[] = ['player-3']
-
-export const TILE_TITLES: Record<TileId, string> = {
-  'header':          'Game Header',
-  'player-0':        'Player 1',
-  'player-1':        'Player 2',
-  'player-2':        'Player 3 (Self)',
-  'player-3':        'Player 4',
-  'self-hand':       'Self Hand',
-  'board':           'Board',
-  'recommendations': 'Recommendations',
-  'risk-chart':      'Mixed Risk',
-  'opponents':       'Opponents',
-  'events':          'Game Events',
-  'notifications':   'Notifications',
-  'bot-responses':   'Bot Responses',
-  'bot-action':      'Bot Action',
-  'bot-show':        'Bot Display',
-  'proxy-control':   'Proxy',
-}

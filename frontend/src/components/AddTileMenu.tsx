@@ -9,21 +9,21 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
+import { useGameStore } from '@/stores/gameStore'
 import { useLayoutStore } from '@/stores/layoutStore'
-import { type Breakpoint, type TileId } from '@/tiles/defaults'
+import { ALL_TILES, type Breakpoint, type TileId } from '@/tiles/defaults'
+import { playerTileTitle, seatOfPlayerTile } from '@/tiles/playerTitle'
 
 // Stable empty fallback — see OpponentsTile note on Zustand selector identity.
 const EMPTY_HIDDEN: readonly TileId[] = []
 
-// Maps each TileId to its localized i18n key. Kept here (not in defaults.ts)
-// because defaults.ts is consumed in non-React contexts (layout calc) where
-// the i18n hook isn't available.
-const TILE_TITLE_KEYS: Record<TileId, string> = {
+// i18n keys for the non-player tiles only. Player titles are seat-relative
+// (see playerTileTitle) and can't live in a static map — a hardcoded key is
+// exactly how "Self" once ended up welded to seat 2. Kept here (not in
+// defaults.ts) because defaults.ts is consumed in non-React contexts
+// (layout calc) where the i18n hook isn't available.
+const TILE_TITLE_KEYS: Partial<Record<TileId, string>> = {
   'header':          'tile.header_full_title',
-  'player-0':        'tile.player_0',
-  'player-1':        'tile.player_1',
-  'player-2':        'tile.player_2',
-  'player-3':        'tile.player_3',
   'self-hand':       'tile.self_hand',
   'board':           'tile.board',
   'recommendations': 'tile.recommendations',
@@ -37,14 +37,36 @@ const TILE_TITLE_KEYS: Record<TileId, string> = {
   'proxy-control':   'tile.proxy_control',
 }
 
+// Canonical order as the tiebreak so equal labels (unlikely, but two tiles
+// could localize to the same word) keep a stable ordering.
+const CANONICAL_RANK = new Map(ALL_TILES.map((id, i) => [id, i] as const))
+
 export function AddTileMenu({ bp }: { bp: Breakpoint }) {
   const { t } = useTranslation()
   const hidden = useLayoutStore((s) => s.hidden[bp] ?? EMPTY_HIDDEN)
   const mode = useLayoutStore((s) => s.mode)
   const show = useLayoutStore((s) => s.show)
+  const ourSeat = useGameStore((s) => s.game?.our_seat ?? null)
+  const numPlayers = useGameStore((s) => s.game?.num_players ?? null)
 
-  // 3p: never offer player-3 in the Add menu.
-  const offered = mode === '3p' ? hidden.filter((id) => id !== 'player-3') : hidden
+  const label = (id: TileId): string => {
+    const seat = seatOfPlayerTile(id)
+    if (seat != null) {
+      return playerTileTitle(t, seat, ourSeat, numPlayers ?? (mode === '3p' ? 3 : 4))
+    }
+    return t(TILE_TITLE_KEYS[id] ?? id)
+  }
+
+  // 3p: never offer player-3 in the Add menu. Listed alphabetically by the
+  // localized label (player names included), not by hide-insertion order.
+  const hiddenIds = mode === '3p' ? hidden.filter((id) => id !== 'player-3') : hidden
+  const offered = hiddenIds
+    .map((id) => ({ id, label: label(id) }))
+    .sort(
+      (a, b) =>
+        a.label.localeCompare(b.label) ||
+        (CANONICAL_RANK.get(a.id) ?? 0) - (CANONICAL_RANK.get(b.id) ?? 0),
+    )
 
   return (
     <DropdownMenu>
@@ -61,9 +83,9 @@ export function AddTileMenu({ bp }: { bp: Breakpoint }) {
           <DropdownMenuItem disabled className="text-xs text-muted-foreground">
             {t('common.all_tiles_visible')}
           </DropdownMenuItem>
-        ) : offered.map((id) => (
+        ) : offered.map(({ id, label }) => (
           <DropdownMenuItem key={id} onClick={() => show(id, bp)} className="text-xs">
-            {t(TILE_TITLE_KEYS[id])}
+            {label}
           </DropdownMenuItem>
         ))}
       </DropdownMenuContent>
