@@ -6,8 +6,9 @@ import { toast } from '@/components/ui/sonner'
 import { useConfigStore } from '@/stores/configStore'
 import { invoke } from '@/lib/tauri'
 
-// Show/hide the always-on-top suggestion overlay, from the Game page toolbar —
-// the one screen you're on when you realise you want it (or want it gone).
+// Show/hide the always-on-top suggestion overlay, from the Overview page
+// action row — the one screen you land on when you realise you want it
+// (or want it gone).
 //
 // It drives the same persisted `overlay.enabled` flag as the Settings card, via
 // `set_overlay_enabled`. The backend broadcasts `overlay-config` afterwards, so
@@ -31,7 +32,7 @@ export function OverlayToggle() {
       await invoke('set_overlay_enabled', { enabled: next })
     } catch (e) {
       setOverlay({ ...overlay, enabled: !next })
-      toast.error(t('game.overlay_toggle_failed'), { description: String(e) })
+      toast.error(t('overview.overlay_toggle_failed'), { description: String(e) })
     } finally {
       setBusy(false)
     }
@@ -39,21 +40,20 @@ export function OverlayToggle() {
 
   // The label stays put and the variant carries the state — a button whose text
   // flips between "Show" and "Hide" makes you read it before every click.
-  const action = overlay.enabled ? t('game.overlay_hide') : t('game.overlay_show')
+  const action = overlay.enabled ? t('overview.overlay_hide') : t('overview.overlay_show')
 
   return (
     <Button
       variant={overlay.enabled ? 'secondary' : 'ghost'}
-      size="sm"
+      size="default"
       onClick={toggle}
       disabled={busy}
-      className="text-xs"
       title={action}
       aria-label={action}
       aria-pressed={overlay.enabled}
     >
       <PictureInPicture2 className="size-4" />
-      {t('game.overlay')}
+      {t('overview.overlay')}
     </Button>
   )
 }

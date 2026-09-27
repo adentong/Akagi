@@ -74,8 +74,8 @@
     /* Page background is dropped one notch below pure white so `--card`
      * (still `oklch(1 0 0)`) reads as a distinct surface — the tweakcn
      * source ships both at pure white and relies on `--border` alone,
-     * which is too faint on the dense GameDashboard grid. The sidebar
-     * shares this value, keeping the page/sidebar continuity intact. */
+     * which is too faint. The sidebar shares this value, keeping the
+     * page/sidebar continuity intact. */
     --background: oklch(0.985 0 0);
     --foreground: oklch(0.145 0 0);
     --card: oklch(1 0 0);
@@ -100,19 +100,6 @@
     --chart-4: oklch(0.49 0.22 264);
     --chart-5: oklch(0.42 0.18 266);
     --radius: 0.625rem;
-    /* Achromatic BotActionTile glyph fills. dahai (打) / none render a
-     * black-on-transparent PNG tinted via mask, so they need a dark tint on
-     * light surfaces; their dark-mode values (white / light grey) live in
-     * `.dark` below. Colored action glyphs carry their own hex and ignore these. */
-    --bot-glyph-neutral: #1f1f1f;
-    --bot-glyph-muted: #5a5a5a;
-    /* Drop-shadow filter for the achromatic glyphs (dahai 打 / none). Colour
-     * action glyphs compute a tinted glow in JS from their hex fill; the
-     * neutral glyphs can't (their fill is a CSS var, not hex), so a JS-computed
-     * bloom falls back to black and smears a heavy black halo around the
-     * already-dark glyph on the light card. Use a soft lift only here so the
-     * glyph reads as clean ink; the dark-mode glow lives in `.dark` below. */
-    --bot-glyph-filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.18));
     --sidebar: oklch(0.985 0 0);
     --sidebar-foreground: oklch(0.145 0 0);
     --sidebar-primary: oklch(0.205 0 0);
@@ -145,17 +132,6 @@
     --border: oklch(0.275 0 0);
     --input: oklch(0.325 0 0);
     --ring: oklch(0.556 0 0);
-    /* Neutral glyph fills on dark — keeps the original HUD look. */
-    --bot-glyph-neutral: #ffffff;
-    --bot-glyph-muted: #d3d3d3;
-    /* Soft white glow + directional drop for the achromatic glyphs on dark,
-     * restoring the glowing HUD look. (Before this token the glow was computed
-     * in JS from the glyph's hex fill; once that fill became a CSS var the glow
-     * fell back to black and vanished against the dark surface.) */
-    --bot-glyph-filter:
-        drop-shadow(0 0 10px rgba(255, 255, 255, 0.5))
-        drop-shadow(0 0 4px rgba(255, 255, 255, 0.4))
-        drop-shadow(0 2px 5px rgba(0, 0, 0, 0.55));
     --chart-1: oklch(0.81 0.10 252);
     --chart-2: oklch(0.62 0.19 260);
     --chart-3: oklch(0.55 0.22 263);
@@ -337,40 +313,3 @@ html.overlay-window #root {
   overflow: hidden;
 }
 
-/* ---- react-grid-layout placeholder + handle skin ----
- * Uses var(--primary) so palette + light/dark swaps cascade automatically.
- */
-.react-grid-item.react-grid-placeholder {
-  background: color-mix(in oklch, var(--primary) 18%, transparent) !important;
-  border: 1px dashed color-mix(in oklch, var(--primary) 55%, transparent);
-  border-radius: var(--radius-lg);
-  opacity: 1 !important;
-}
-
-.react-grid-item > .react-resizable-handle {
-  opacity: 0.4;
-}
-
-.react-grid-item > .react-resizable-handle::after {
-  border-color: var(--primary);
-}
-
-/* ---- Dashboard function-tile separation ----
- * Each GameDashboard panel is a shadcn Card (via TileFrame) edged only by
- * `ring-1 ring-foreground/10`. That ring is an *outset* box-shadow, and
- * react-grid-layout wraps every tile in an `overflow-hidden` item, so the ring
- * (and any outer drop-shadow) is clipped away and never shows. In light mode
- * the near-white card on the near-white page then has no edge cue at all; in
- * dark mode fill contrast hints at it but there's still no crisp border. Fix
- * with an *inset* hairline: it paints just inside the card border, follows the
- * rounded corners, and survives the ancestor clip, so the edge reads on all
- * four sides. `var(--foreground)` makes it theme-aware — a dark line on the
- * light card, a light line on the dark card — so it applies in both modes.
- * Dark mode uses a lower alpha because a light line on a dark surface reads
- * stronger than a dark line on a light one at the same opacity. */
-.tile-frame {
-  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--foreground) 22%, transparent);
-}
-.dark .tile-frame {
-  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--foreground) 12%, transparent);
-}

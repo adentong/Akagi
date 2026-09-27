@@ -114,7 +114,7 @@ describe('Sidebar drawer (below lg)', () => {
     renderSidebar('/')
     openDrawer()
 
-    fireEvent.click(screen.getByRole('link', { name: 'nav.game' }))
+    fireEvent.click(screen.getByRole('link', { name: 'nav.bots' }))
     expect(useSidebar.getState().isDrawerOpen).toBe(false)
   })
 

@@ -32,8 +32,6 @@
 //! | `bot-status`       | `schema::BotStatus`           |
 //! | `capture-status`   | `schema::CaptureStatus`       |
 //! | `notify`           | `schema::Notification`        |
-//! | `analysis-result`  | `analysis::AnalysisResult`    |
-//! | `history-recorded` | `schema::HistoryEvent`        |
 //! | `overlay-config`   | `config::OverlayConfig`       |
 //!
 //! All of the above are broadcast to every webview, which is what lets the
@@ -68,16 +66,6 @@ fn spawn_forwarders<R: Runtime>(app: AppHandle<R>, state: AppState) {
         "bot-response",
     );
     forward(app.clone(), state.notify_bus.subscribe(), "notify");
-    forward(
-        app.clone(),
-        state.analysis_bus.subscribe(),
-        "analysis-result",
-    );
-    forward(
-        app.clone(),
-        state.history_bus.subscribe(),
-        "history-recorded",
-    );
 
     // Status buses: forward AND snapshot into AppState.
     spawn_bot_status_forwarder(app.clone(), state.clone());

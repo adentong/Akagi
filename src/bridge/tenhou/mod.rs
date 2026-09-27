@@ -28,7 +28,7 @@ use crate::{
     config::Platform,
     event_bus::NotifyBus,
     logger::{FlowLogger, Session},
-    schema::{mjai::Actor, GameMeta, MatchInfo, MjaiEvent, Notification},
+    schema::{mjai::Actor, MjaiEvent, Notification},
 };
 use chrono::Local;
 use meld::{Meld, MeldKind};
@@ -46,8 +46,6 @@ const REINIT_RIICHI_MARK: u32 = 255;
 /// Per-flow Tenhou state. One bridge instance per WebSocket connection.
 pub struct TenhouBridge {
     state: State,
-    #[allow(dead_code)]
-    flow_log: Option<Arc<FlowLogger>>,
     session: Option<Arc<Session>>,
     mjai_log: Option<Arc<FlowLogger>>,
     /// Autoplay's view of the hand and the current decision window. Written
@@ -63,10 +61,9 @@ pub struct TenhouBridge {
 }
 
 impl TenhouBridge {
-    pub fn new(flow_log: Option<Arc<FlowLogger>>, session: Option<Arc<Session>>) -> Self {
+    pub fn new(session: Option<Arc<Session>>) -> Self {
         Self {
             state: State::default(),
-            flow_log,
             session,
             mjai_log: None,
             shared: None,
@@ -195,7 +192,7 @@ impl TenhouBridge {
         // needs the hand and window it maintains); only the stream is
         // withheld until `on_init` lifts the suspension at the next kyoku.
         // The one exception is the game's end: the tracker has to close the
-        // game, the bot manager stop its runner, History reset — so
+        // game and the bot manager stop its runner — so
         // `end_game` alone passes, and as terminated (see `end_game_event`).
         if self.state.suspended {
             let before = events.len();
@@ -214,8 +211,7 @@ impl TenhouBridge {
     /// The game-end event for this flow. A game this flow joined mid-way has
     /// no complete record — the hands before the rejoin were never seen here
     /// — so its end is reported as terminated: the tracker and bots still
-    /// close the game, but History drops it instead of filing the remainder
-    /// as a full game with its own per-hand stats.
+    /// close the game, and the terminated reason marks it as incomplete.
     fn end_game_event(&self) -> MjaiEvent {
         if self.state.rejoined_mid_game {
             MjaiEvent::terminated_game()
@@ -266,14 +262,13 @@ impl TenhouBridge {
     }
 
     /// `<GO type="…" lobby="…"/>` — rules/room announcement, sent before
-    /// `<TAIKYOKU/>`. No mjai events; the raw bitfield is stashed for
-    /// history's `MatchInfo` (room tier lives in bits 0x20 / 0x80). Bit
+    /// `<TAIKYOKU/>`. No mjai events; the raw bitfield is stashed for the
+    /// sanma detection below. Bit
     /// 0x10 is the three-player flag — the earliest sanma signal, and the
     /// only one a flow gets before its first kyoku frame when that frame is
     /// not the E1H0 `<INIT/>` (see `on_init`).
     fn on_go(&mut self, msg: &JsonValue) -> Vec<MjaiEvent> {
         self.state.go_type = parse_u32(msg, "type");
-        self.state.lobby = parse_u32(msg, "lobby");
         if let Some(three) = self.state.three_players_hint() {
             self.state.set_three_players(three);
         }
@@ -311,13 +306,9 @@ impl TenhouBridge {
     /// `<INIT/>`, where the 0-score slot reveals whether the game is sanma.
     /// Without that wait we'd stamp `start_game.num_players = 4` on every
     /// sanma game (Tenhou's TAIKYOKU itself carries no player-count signal —
-    /// only the dealer's relative seat). The `log` attribute is the paifu id.
+    /// only the dealer's relative seat).
     fn on_taikyoku(&mut self, msg: &JsonValue) -> Vec<MjaiEvent> {
         let oya_rel = parse_u8(msg, "oya").unwrap_or(0);
-        self.state.log_id = msg
-            .get("log")
-            .and_then(JsonValue::as_str)
-            .map(str::to_string);
         // oya is dealer's *relative* seat in the 4-cycle wire frame. Our
         // wire-abs seat is the inverse: (-oya_rel) mod 4. For sanma our
         // wire-abs is always in {0, 1, 2} because we are a real player —
@@ -418,29 +409,12 @@ impl TenhouBridge {
         }
         self.state.pending_start_game = false;
         let names = self.build_start_names();
-        // Read non-destructively: a reconnect can replay TAIKYOKU+INIT
-        // without a fresh <GO/>, and the re-emitted start_game must keep the
-        // room bitfield. A *new* game always sends its own <GO/> (and every
-        // TAIKYOKU reassigns log_id), so staleness across games isn't a
-        // concern. Names ARE consumed (in `build_start_names`): a stale
-        // roster is worse than a missing one, and reconnects resend the full
-        // <UN/>.
-        let match_info = MatchInfo::Tenhou {
-            log_id: self.state.log_id.clone(),
-            go_type: self.state.go_type,
-            lobby: self.state.lobby,
-        };
         Some(MjaiEvent::StartGame {
             names,
             kyoku_first: None,
             aka_flag: None,
             id: Some(self.state.seat as Actor),
             num_players: self.state.num_players,
-            game_meta: Some(GameMeta {
-                game_id: None,
-                match_mode: None,
-                match_info: Some(match_info),
-            }),
         })
     }
 
@@ -1526,7 +1500,7 @@ mod tests {
 
     #[test]
     fn ignores_up_direction() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let out = b.parse(Direction::Up, br#"{"tag":"INIT"}"#);
         assert!(out.events.is_empty());
         assert!(out.parsed.is_none());
@@ -1534,7 +1508,7 @@ mod tests {
 
     #[test]
     fn heartbeat_yields_no_events_but_visible_in_inspector() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let out = b.parse(Direction::Down, b"<Z/>");
         assert!(out.events.is_empty());
         // Heartbeat is surfaced as parsed for inspector visibility.
@@ -1544,7 +1518,7 @@ mod tests {
 
     #[test]
     fn parsed_view_carries_tag_and_args() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let frame = br#"{"tag":"INIT","seed":"1,0,0,2,5,134","ten":"250,250,250,250"}"#;
         let out = b.parse(Direction::Down, frame);
         let parsed = out.parsed.expect("INIT should produce parsed view");
@@ -1554,7 +1528,7 @@ mod tests {
 
     #[test]
     fn malformed_json_does_not_panic() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let out = b.parse(Direction::Down, b"not json");
         assert!(out.events.is_empty());
         assert!(out.parsed.is_none());
@@ -1562,7 +1536,7 @@ mod tests {
 
     #[test]
     fn taikyoku_resolves_seat_but_defers_start_game() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // TAIKYOKU now only resolves seat and primes the pending flag.
         // start_game is emitted at the first INIT (when sanma is known).
         let events = parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"1"}"#);
@@ -1571,11 +1545,10 @@ mod tests {
 
     /// GO / UN / TAIKYOKU metadata surfaces on `start_game`: real roster
     /// names (percent-decoded, remapped from wire-relative to wire-absolute
-    /// seats) plus `MatchInfo::Tenhou` with the room bitfield, lobby and
-    /// paifu id.
+    /// seats).
     #[test]
     fn go_un_taikyoku_metadata_reaches_start_game() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"GO","type":"169","lobby":"0"}"#);
         // n0 is *us* (wire-relative); "%E3%81%82" decodes to "あ".
         parse_one(
@@ -1590,12 +1563,7 @@ mod tests {
         let init = r#"{"tag":"INIT","seed":"0,0,0,1,2,4","ten":"250,250,250,250","oya":"1","hai":"0,4,8,36,40,44,72,76,80,108,112,116,120"}"#;
         let events = parse_one(&mut b, init);
         match &events[0] {
-            MjaiEvent::StartGame {
-                id,
-                names,
-                game_meta,
-                ..
-            } => {
+            MjaiEvent::StartGame { id, names, .. } => {
                 assert_eq!(*id, Some(3));
                 // rel [us, shimocha, toimen, kamicha] → abs [3, 0, 1, 2].
                 assert_eq!(
@@ -1607,19 +1575,6 @@ mod tests {
                         "あ".to_string(),
                     ]
                 );
-                let meta = game_meta.as_ref().expect("tenhou game meta");
-                match &meta.match_info {
-                    Some(MatchInfo::Tenhou {
-                        log_id,
-                        go_type,
-                        lobby,
-                    }) => {
-                        assert_eq!(log_id.as_deref(), Some("2026082300gm-00a9-0000-deadbeef"));
-                        assert_eq!(*go_type, Some(169));
-                        assert_eq!(*lobby, Some(0));
-                    }
-                    other => panic!("expected Tenhou match_info, got {other:?}"),
-                }
             }
             other => panic!("expected StartGame first, got {other:?}"),
         }
@@ -1629,7 +1584,7 @@ mod tests {
     /// clobber a full roster (or install a mostly-empty one).
     #[test]
     fn partial_un_does_not_replace_roster() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(
             &mut b,
             r#"{"tag":"UN","n0":"alice","n1":"bob","n2":"carol","n3":"dave"}"#,
@@ -1663,7 +1618,7 @@ mod tests {
     /// seats and the emitted vector stays length 3.
     #[test]
     fn sanma_un_names_skip_the_ghost_slot() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(
             &mut b,
             r#"{"tag":"UN","n0":"alice","n1":"","n2":"bob","n3":"carol"}"#,
@@ -1700,7 +1655,7 @@ mod tests {
 
     #[test]
     fn init_emits_start_game_then_start_kyoku_yonma() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // Dealer at rel 1 → our wire-abs = (4-1)%4 = 3.
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"1"}"#);
         let init = r#"{"tag":"INIT","seed":"0,0,0,1,2,4","ten":"250,250,250,250","oya":"1","hai":"0,4,8,36,40,44,72,76,80,108,112,116,120"}"#;
@@ -1762,7 +1717,7 @@ mod tests {
     /// Second INIT in the same game must NOT re-emit start_game.
     #[test]
     fn second_init_does_not_repeat_start_game() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         let init_e1 = r#"{"tag":"INIT","seed":"0,0,0,1,2,4","ten":"250,250,250,250","oya":"0","hai":"0,4,8,36,40,44,72,76,80,108,112,116,120"}"#;
         let e1 = parse_one(&mut b, init_e1);
@@ -1781,7 +1736,7 @@ mod tests {
     /// as players 2/3/4 regardless of actual table position."
     #[test]
     fn init_yonma_remaps_scores_rel_to_abs() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // TAIKYOKU oya=1 → our absolute seat = (4-1)%4 = 3.
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"1"}"#);
         // ten in relative order: us=100, shimocha=200, toimen=300, kamicha=400.
@@ -1807,7 +1762,7 @@ mod tests {
 
     #[test]
     fn init_detects_sanma_via_zero_score() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         // 4-element ten with one slot 0 indicates sanma.
         let init = r#"{"tag":"INIT","seed":"0,0,0,1,2,4","ten":"350,350,350,0","oya":"0","hai":"0,4,8,36,40,44,72,76,80,108,112,116,120"}"#;
@@ -1849,7 +1804,7 @@ mod tests {
     /// rel-3 ghost slot which also holds 0.
     #[test]
     fn init_sanma_preserves_real_zero_point_player() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // Our seat = 0 (oya=0). E1H0 with a 0 slot triggers sanma detection.
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
@@ -1879,7 +1834,7 @@ mod tests {
 
     #[test]
     fn tsumo_for_self_reveals_tile() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
             &mut b,
@@ -1897,7 +1852,7 @@ mod tests {
 
     #[test]
     fn tsumo_for_other_player_is_unknown() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
             &mut b,
@@ -1915,7 +1870,7 @@ mod tests {
 
     /// Bridge at our seat 0 (dealer), one kyoku started, ready for discards.
     fn bridge_in_kyoku() -> TenhouBridge {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
             &mut b,
@@ -1992,7 +1947,7 @@ mod tests {
     /// tedashi as tsumogiri.
     #[test]
     fn dahai_after_our_pon_is_tedashi_not_tsumogiri() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         // Hand holds two 1m (indices 0, 1) so we can pon a third.
         parse_one(
@@ -2056,7 +2011,7 @@ mod tests {
     /// reports true.
     #[test]
     fn dahai_of_rinshan_draw_after_ankan_is_tsumogiri() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         // Four 5m (16..19, 16 is the red) so we can ankan them.
         parse_one(
@@ -2088,7 +2043,7 @@ mod tests {
     /// never pressed.
     #[test]
     fn an_opponents_kakan_with_t_opens_a_ron_window() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
             &mut b,
@@ -2107,7 +2062,7 @@ mod tests {
     /// stale one would let a later bot reply act into the caller's turn.
     #[test]
     fn an_opponents_kakan_without_t_opens_nothing() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
             &mut b,
@@ -2124,7 +2079,7 @@ mod tests {
     /// draw that follows opens the real one.
     #[test]
     fn our_own_kakan_opens_no_window_even_with_t() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
             &mut b,
@@ -2136,7 +2091,7 @@ mod tests {
 
     #[test]
     fn agari_emits_full_hora_then_endkyoku() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
             &mut b,
@@ -2168,7 +2123,7 @@ mod tests {
 
     #[test]
     fn ryukyoku_emits_deltas_then_endkyoku() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
             &mut b,
@@ -2192,7 +2147,7 @@ mod tests {
 
     #[test]
     fn agari_with_owari_appends_endgame() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
             &mut b,
@@ -2213,7 +2168,7 @@ mod tests {
     /// captured from log `20260512-135922/inspector.jsonl:1106`.
     #[test]
     fn agari_ron_from_capital_w_fromwho_resolves_to_discarder() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // TAIKYOKU oya=0 → our absolute seat = (4-0)%4 = 0. Winner=0 (us),
         // discarder=2 (kamicha across). Both arrive as *relative* seats in
         // the AGARI frame; rel_to_abs is identity here because our seat is 0.
@@ -2259,7 +2214,7 @@ mod tests {
 
     #[test]
     fn reach_step_one_then_two() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         parse_one(
             &mut b,
@@ -2280,7 +2235,7 @@ mod tests {
     /// legacy XML docstring was misleading.
     #[test]
     fn captured_init_hand_uses_bare_hai_key() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // TAIKYOKU oya=3 → our absolute seat = (4-3)%4 = 1.
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"3"}"#);
         let init = r#"{"tag":"INIT","seed":"0,0,0,0,3,101","ten":"250,250,250,250","oya":"3","hai":"65,108,40,123,61,67,32,134,120,132,78,52,91"}"#;
@@ -2310,7 +2265,7 @@ mod tests {
 
     #[test]
     fn dora_emits_marker() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let events = parse_one(&mut b, r#"{"tag":"DORA","hai":"108"}"#);
         match &events[0] {
             MjaiEvent::Dora { dora_marker } => assert_eq!(dora_marker, "E"),
@@ -2337,7 +2292,7 @@ mod tests {
     /// ```
     #[test]
     fn captured_sanma_game_seat_one_assigns_correct_actors() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let taikyoku = parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"3"}"#);
         assert!(taikyoku.is_empty(), "start_game deferred until INIT");
 
@@ -2467,7 +2422,7 @@ mod tests {
     /// `rel_to_abs(3) = (3 + seat) % 4` where seat=1.
     #[test]
     fn yonma_init_oya_three_with_seat_one_resolves_to_zero() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // TAIKYOKU oya=3 → seat=(4-3)%4=1.
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"3"}"#);
         let init = parse_one(
@@ -2510,7 +2465,7 @@ mod tests {
     /// on the right seat with a fresh `start_game`.
     #[test]
     fn reinit_on_a_fresh_flow_resolves_seat_and_suspends_until_next_init() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // E3 (seed 2): the dealer is wire-abs 2 and we see them at rel 1,
         // so we sit at wire-abs 1.
         let reinit = format!(
@@ -2593,7 +2548,7 @@ mod tests {
     /// boundary): the first `<INIT/>` alone must place us and open the game.
     #[test]
     fn init_on_a_fresh_flow_derives_seat_and_opens_the_game() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // S2 (seed 5): dealer wire-abs 1, seen at rel 3 → we sit at 2.
         let init = format!(
             r#"{{"tag":"INIT","seed":"5,0,1,1,2,8","ten":"200,300,250,240","oya":"3","hai":"{HAND_NO_1M}"}}"#
@@ -2642,7 +2597,7 @@ mod tests {
     /// the one frame that says the same thing TAIKYOKU does, so it wins.
     #[test]
     fn taikyoku_seat_wins_over_a_disagreeing_kyoku_frame() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"1"}"#); // seat 3
                                                               // E2 (seed 1): dealer wire-abs 1 sits at rel 2 from seat 3; oya "0"
                                                               // would put us at 1.
@@ -2660,7 +2615,7 @@ mod tests {
         }
 
         // E1H0 disagreeing with TAIKYOKU: the deal wins.
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"1"}"#); // seat 3
         let init = format!(
             r#"{{"tag":"INIT","seed":"0,0,0,1,2,4","ten":"250,250,250,250","oya":"0","hai":"{HAND_NO_1M}"}}"#
@@ -2679,7 +2634,7 @@ mod tests {
     /// order of play, so the hand is withheld).
     #[test]
     fn reinit_after_taikyoku_keeps_the_taikyoku_seat() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"2"}"#); // seat 2
         let reinit = format!(
             r#"{{"tag":"REINIT","seed":"0,0,0,1,2,4","ten":"250,250,250,250","oya":"2","hai":"{HAND_NO_1M}","kawa0":"20","kawa2":"5"}}"#
@@ -2710,7 +2665,7 @@ mod tests {
     /// thing seen, so the draw the snapshot could not show is filled in.
     #[test]
     fn a_draw_the_snapshot_could_not_show_is_filled_in() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let events = parse_one(&mut b, &rebuilt_reinit());
         assert!(matches!(
             &events[0],
@@ -2733,7 +2688,7 @@ mod tests {
     /// for the next hand.
     #[test]
     fn live_play_that_contradicts_the_rebuilt_hand_suspends_it() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, &rebuilt_reinit());
         // Seat 3 cannot discard before seat 2 has.
         assert!(parse_one(&mut b, r#"{"tag":"G3"}"#).is_empty());
@@ -2746,7 +2701,7 @@ mod tests {
     /// the window is open. A repeat of that draw changes nothing.
     #[test]
     fn a_rejoin_on_our_own_turn_asks_for_our_discard() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let reinit = format!(
             r#"{{"tag":"REINIT","seed":"0,0,0,1,2,130","ten":"250,250,250,250","oya":"0","hai":"{HAND_NO_1M},124","kawa0":"0","kawa1":"1","kawa2":"2","kawa3":"3"}}"#
         );
@@ -2778,7 +2733,7 @@ mod tests {
     /// tail, where the tsumogiri check and the encoder look for it.
     #[test]
     fn in_riichi_the_rebuilt_draw_goes_to_the_tail_of_the_hand() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // 123456789m 11p 34p (waiting on 2p / 5p) plus a drawn 2m (5);
         // riichi on our first discard.
         let reinit = r#"{"tag":"REINIT","seed":"0,0,1,1,2,130","ten":"240,250,250,250","oya":"0","hai":"0,4,5,8,12,17,20,24,28,32,36,37,44,48","kawa0":"255,108","kawa1":"112","kawa2":"116","kawa3":"120"}"#;
@@ -2804,7 +2759,7 @@ mod tests {
     /// but it is not a tsumogiri.
     #[test]
     fn a_rejoin_right_after_our_pon_owes_a_discard_with_nothing_drawn() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // Pon of P (124 called, 125/126 ours) from the left (rel 3).
         let pon = (93u32 << 9) | (3 << 5) | 0x8 | 3;
         let reinit = format!(
@@ -2846,7 +2801,7 @@ mod tests {
     /// window) is not played twice, and the hand carries on.
     #[test]
     fn the_last_discard_sent_again_is_not_played_twice() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, &rebuilt_reinit());
         assert!(parse_one(&mut b, r#"{"tag":"E1","t":"1"}"#).is_empty());
         assert!(!b.state.suspended);
@@ -2862,7 +2817,7 @@ mod tests {
     /// A tsumo win as the first live frame needs the winner's draw first.
     #[test]
     fn a_tsumo_win_right_after_the_rejoin_gets_its_draw() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, &rebuilt_reinit());
         let events = parse_one(
             &mut b,
@@ -2893,7 +2848,7 @@ mod tests {
     #[test]
     fn a_rejoin_carries_on_from_what_the_dropped_flow_saw() {
         let slot = journal::new_shared();
-        let mut flow1 = TenhouBridge::new(None, None).with_journal(Some(slot.clone()));
+        let mut flow1 = TenhouBridge::new(None).with_journal(Some(slot.clone()));
         let init = format!(
             r#"{{"tag":"INIT","seed":"0,0,0,1,2,130","ten":"250,250,250,250","oya":"0","hai":"{HAND_NO_1M}"}}"#
         );
@@ -2917,7 +2872,7 @@ mod tests {
 
         // The flow drops; the server discards our draw for us and the next
         // seat plays a turn before the client is back.
-        let mut flow2 = TenhouBridge::new(None, None).with_journal(Some(slot));
+        let mut flow2 = TenhouBridge::new(None).with_journal(Some(slot));
         let reinit = format!(
             r#"{{"tag":"REINIT","seed":"0,0,0,1,2,130","ten":"250,250,250,250","oya":"0","hai":"{HAND_NO_1M}","m1":"{pon}","kawa0":"0","kawa1":"37,49","kawa2":"41","kawa3":"45"}}"#
         );
@@ -2952,7 +2907,7 @@ mod tests {
     fn reinit_restores_our_calls_and_draw_in_hand() {
         use crate::autoplay::tenhou_state::new_shared;
         let shared = new_shared();
-        let mut b = TenhouBridge::new(None, None).with_shared_state(Some(shared.clone()));
+        let mut b = TenhouBridge::new(None).with_shared_state(Some(shared.clone()));
         // Pon of 1p (t=27 → tile type 9) from rel 1; see meld.rs bit layout.
         let pon = (27u32 << 9) | 8 | 1;
         // 10 concealed tiles + one pon = no draw in hand.
@@ -2983,7 +2938,7 @@ mod tests {
     /// signal a rejoining flow gets when the next kyoku is not E1H0.
     #[test]
     fn go_type_sanma_bit_sets_three_players_before_the_first_kyoku() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"GO","type":"25","lobby":"0"}"#); // 0x19
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         // E2 mid-game: no E1H0 check to fall back on. Ghost is rel 3 for seat 0.
@@ -3006,7 +2961,7 @@ mod tests {
     /// Without `<GO/>`, a roster with one empty slot says sanma.
     #[test]
     fn un_roster_with_an_empty_slot_marks_sanma() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(
             &mut b,
             r#"{"tag":"UN","n0":"alice","n1":"","n2":"bob","n3":"carol"}"#,
@@ -3036,7 +2991,7 @@ mod tests {
     /// The E1H0 score check stays authoritative over a wrong hint.
     #[test]
     fn e1h0_init_overrides_a_wrong_sanma_hint() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, r#"{"tag":"GO","type":"25","lobby":"0"}"#);
         parse_one(&mut b, r#"{"tag":"TAIKYOKU","oya":"0"}"#);
         assert!(b.state.is_3p, "hint applied");
@@ -3063,7 +3018,7 @@ mod tests {
         let reinit = format!(
             r#"{{"tag":"REINIT","seed":"1,0,0,1,2,8","ten":"340,300,400,0","oya":"1","hai":"{sanma_hand}","kawa0":"36","kawa1":"40","kawa2":"44"}}"#
         );
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, &reinit);
         assert_eq!(b.state.seat, 0);
         assert!(b.state.is_3p);
@@ -3077,21 +3032,21 @@ mod tests {
 
         // A 5m in hand rules sanma out even with the other signs.
         let reinit = r#"{"tag":"REINIT","seed":"1,0,0,1,2,8","ten":"340,300,400,0","oya":"1","hai":"17,32,36,40,44,72,76,80,108,112,116,120,124","kawa0":"36","kawa1":"40","kawa2":"44"}"#;
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, reinit);
         assert!(!b.state.is_3p);
         // So does a 2m–8m in anyone's river...
         let reinit = format!(
             r#"{{"tag":"REINIT","seed":"1,0,0,1,2,8","ten":"340,300,400,0","oya":"1","hai":"{sanma_hand}","kawa0":"36","kawa1":"20","kawa2":"44"}}"#
         );
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, &reinit);
         assert!(!b.state.is_3p);
         // ...or a river on the 4th wire slot.
         let reinit = format!(
             r#"{{"tag":"REINIT","seed":"1,0,0,1,2,8","ten":"340,300,400,0","oya":"1","hai":"{sanma_hand}","kawa0":"36","kawa1":"40","kawa2":"44","kawa3":"48"}}"#
         );
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, &reinit);
         assert!(!b.state.is_3p);
 
@@ -3099,13 +3054,13 @@ mod tests {
         // sanma even with a 4p-looking hand, 100000 is yonma even with a
         // sanma-looking one.
         let reinit = r#"{"tag":"REINIT","seed":"1,0,0,1,2,8","ten":"350,300,400,0","oya":"1","hai":"17,32,36,40,44,72,76,80,108,112,116,120,124","kawa0":"36"}"#;
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, reinit);
         assert!(b.state.is_3p);
         let reinit = format!(
             r#"{{"tag":"REINIT","seed":"1,0,0,1,2,8","ten":"250,250,500,0","oya":"1","hai":"{sanma_hand}","kawa0":"36"}}"#
         );
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(&mut b, &reinit);
         assert!(!b.state.is_3p);
     }
@@ -3116,7 +3071,7 @@ mod tests {
     /// discarded before the dealer, us, has.)
     #[test]
     fn new_game_after_a_suspended_hand_resumes_normally() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let reinit = format!(
             r#"{{"tag":"REINIT","seed":"7,0,0,1,2,4","ten":"250,250,250,250","oya":"0","hai":"{HAND_NO_1M}","kawa1":"33"}}"#
         );
@@ -3162,11 +3117,11 @@ mod tests {
     }
 
     /// The hands after the rejoin resume normally, but the game as a whole
-    /// was never seen by this flow, so its end is still terminated: History
-    /// must not file the remainder as a complete game.
+    /// was never seen by this flow, so its end is still terminated: the game
+    /// is marked incomplete.
     #[test]
     fn rejoined_game_ends_terminated_even_after_resuming() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // Rejoined before the dealer's first draw: the hand is rebuilt (as
         // nothing yet) and the game opens here.
         let reinit = format!(
@@ -3201,7 +3156,7 @@ mod tests {
     /// E1H0 re-seats the flow, reopens the game, and clears the rejoin.
     #[test]
     fn first_deal_without_taikyoku_opens_a_new_game() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let reinit = format!(
             r#"{{"tag":"REINIT","seed":"7,0,0,1,2,4","ten":"250,250,250,250","oya":"0","hai":"{HAND_NO_1M}"}}"#
         );
@@ -3240,7 +3195,7 @@ mod tests {
     /// hand's size alone: the draw-in-hand judgement must not count it.
     #[test]
     fn reinit_does_not_count_nukidora_when_judging_the_draw_in_hand() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // Sanma table (35000 × 3), two kita declared (north tiles 120 and
         // 121, `m` low bits 0x20).
         let kita = format!("{},{}", (120 << 8) | 0x20, (121 << 8) | 0x20);
@@ -3262,7 +3217,7 @@ mod tests {
     /// count off the table total on its first INIT.
     #[test]
     fn init_on_a_fresh_flow_reads_player_count_off_the_scores() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         // S1 (seed 4): dealer wire-abs 0 at rel 2 → seat 2. Total 105000.
         let init = r#"{"tag":"INIT","seed":"4,0,0,1,2,8","ten":"400,300,350,0","oya":"2","hai":"0,32,36,40,44,72,76,80,108,112,116,120,124"}"#;
         let events = parse_one(&mut b, init);
@@ -3273,7 +3228,7 @@ mod tests {
         assert_eq!(tehais_len(&events), 3);
 
         // Yonma with one riichi stick out: 99000 + 1000.
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         let init = format!(
             r#"{{"tag":"INIT","seed":"1,0,1,1,2,8","ten":"240,250,250,250","oya":"1","hai":"{HAND_NO_1M}"}}"#
         );
@@ -3292,7 +3247,7 @@ mod tests {
     /// The hand is rebuilt from the snapshot and play goes on from it.
     #[test]
     fn rejoin_sequence_as_captured_from_the_web_client() {
-        let mut b = TenhouBridge::new(None, None);
+        let mut b = TenhouBridge::new(None);
         parse_one(
             &mut b,
             r#"{"tag":"GO","type":"1","lobby":"0","gpid":"00000000-00000000"}"#,

@@ -27,7 +27,6 @@ import {
 import { HAS_TAURI, invoke } from '@/lib/tauri'
 import { openExternal } from '@/lib/external'
 import { useSidebar } from '@/hooks/useSidebar'
-import { useAnnouncementStore } from '@/stores/announcementStore'
 import { useCaptureStore } from '@/stores/captureStore'
 import { useConfigStore } from '@/stores/configStore'
 import { selectHasNotifiableUpdate, useUpdaterStore } from '@/stores/updaterStore'
@@ -60,6 +59,7 @@ import {
 } from '@/types'
 import type {
   AppConfig,
+  AutoplayConfig,
   CaptureMode,
   DelayMode,
   DelayModelConfig,
@@ -78,12 +78,6 @@ export function Settings() {
   const [draft, setDraft] = useState<AppConfig | null>(stored)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState<string | null>(null)
-  // Riichi City autoplay is MITM frame injection — pop a risk warning the
-  // moment the draft combines the two, from either direction (platform
-  // switched to Riichi City while autoplay is on, or autoplay switched on
-  // while the platform is Riichi City).
-  const [rcAutoplayWarnOpen, setRcAutoplayWarnOpen] = useState(false)
-
   useEffect(() => {
     // Sync the editable draft from the store when it (re)loads.
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -220,7 +214,6 @@ export function Settings() {
       <PlatformCard
         draft={draft}
         setDraft={setDraft}
-        onRiichiCityAutoplay={() => setRcAutoplayWarnOpen(true)}
       />
 
       <CaptureCard draft={draft} setDraft={setDraft} />
@@ -294,7 +287,6 @@ export function Settings() {
       <AutoplayCard
         draft={draft}
         setDraft={setDraft}
-        onRiichiCityAutoplay={() => setRcAutoplayWarnOpen(true)}
       />
 
       <NetworkCard draft={draft} setDraft={setDraft} />
@@ -323,22 +315,6 @@ export function Settings() {
             </Button>
             <Button size="sm" onClick={saveAndLeave} disabled={saving}>
               {saving ? t('common.saving') : t('settings.save_and_leave')}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={rcAutoplayWarnOpen} onOpenChange={setRcAutoplayWarnOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{t('settings.autoplay.rc_warning_title')}</DialogTitle>
-            <DialogDescription>
-              {t('settings.autoplay.rc_warning_desc')}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter className="bg-transparent p-0 border-0 mx-0 mb-0">
-            <Button size="sm" onClick={() => setRcAutoplayWarnOpen(false)}>
-              {t('settings.autoplay.rc_warning_ack')}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -799,19 +775,14 @@ function UiScaleField() {
 function PlatformCard({
   draft,
   setDraft,
-  onRiichiCityAutoplay,
 }: {
   draft: AppConfig
   setDraft: (c: AppConfig) => void
-  onRiichiCityAutoplay: () => void
 }) {
   const { t } = useTranslation()
   const current = draft.platform.kind
   const setKind = (kind: PlatformKind) => {
     if (kind === current) return
-    if (kind === 'RiichiCity' && (draft.autoplay?.enabled ?? false)) {
-      onRiichiCityAutoplay()
-    }
     // If the user hasn't customised the Chromium start URL, swap it to
     // the new platform's default so the next launch lands on the right
     // game. A user-customised URL is left alone — the URL field below
@@ -866,11 +837,9 @@ function PlatformCard({
 function AutoplayCard({
   draft,
   setDraft,
-  onRiichiCityAutoplay,
 }: {
   draft: AppConfig
   setDraft: (c: AppConfig) => void
-  onRiichiCityAutoplay: () => void
 }) {
   const { t } = useTranslation()
   const ap = draft.autoplay ?? {
@@ -883,10 +852,10 @@ function AutoplayCard({
       click_hold_ms: [60, 140],
       verify_input_ms: [300, 500],
       click_retries: 2,
-      reload_after_failures: 3,
       dealer_first_discard_extra_delay_ms: [2000, 3000],
     },
     delay: defaultDelayModel(),
+    riichi_city: defaultRiichiCityAutoplay(),
   }
   const delay = ap.delay ?? defaultDelayModel()
   const captureIsChromium = draft.capture?.mode === 'chromium'
@@ -914,10 +883,7 @@ function AutoplayCard({
         <Toggle
           label={t('settings.autoplay.enable')}
           value={ap.enabled}
-          onChange={(v) => {
-            setApField({ enabled: v })
-            if (v && platformIsRiichiCity) onRiichiCityAutoplay()
-          }}
+          onChange={(v) => setApField({ enabled: v })}
         />
         <p className="text-xs text-muted-foreground">
           {t('settings.autoplay.enable_help')}
@@ -1031,22 +997,6 @@ function AutoplayCard({
             }
           />
         </Field>
-        <Field
-          label={t('settings.autoplay.reload_after_failures')}
-          hint={t('settings.autoplay.reload_after_failures_hint')}
-        >
-          <Input
-            type="number"
-            inputMode="numeric"
-            min={0}
-            value={ap.majsoul.reload_after_failures}
-            onChange={(e) =>
-              setMajsoulField({
-                reload_after_failures: Number(e.target.value || 0),
-              })
-            }
-          />
-        </Field>
         <RangeField
           label={t('settings.autoplay.dealer_first_discard_extra_delay')}
           hint={t('settings.autoplay.dealer_first_discard_extra_delay_hint')}
@@ -1061,6 +1011,16 @@ function AutoplayCard({
       </CardContent>
     </Card>
   )
+}
+
+/** Mirror of `RiichiCityAutoplayConfig::default()` on the Rust side. */
+function defaultRiichiCityAutoplay(): AutoplayConfig['riichi_city'] {
+  return {
+    room: 'galaxy',
+    game_type: 'east_only',
+    galaxy_fallback_sun: false,
+    inter_game_delay_ms: 8000,
+  }
 }
 
 /** Mirror of `DelayModelConfig::default()` on the Rust side. */
@@ -1492,13 +1452,6 @@ function UpdatesCard() {
         <div className="flex items-center justify-between gap-2">
           <span className="text-xs text-muted-foreground">{lastCheckedLabel}</span>
           <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => useAnnouncementStore.getState().openHistory()}
-            >
-              {t('announcements.dialog.settings_button')}
-            </Button>
             <Button
               size="sm"
               variant="outline"

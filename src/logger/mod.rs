@@ -6,7 +6,6 @@ mod stream;
 pub use binary::BinaryLogger;
 pub use flow::FlowLogger;
 pub use session::{LogTarget, Session};
-pub use stream::LogStreamHandle;
 
 use anyhow::Result;
 use std::path::Path;
