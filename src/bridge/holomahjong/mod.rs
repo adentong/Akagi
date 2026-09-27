@@ -250,9 +250,7 @@ impl HoloMahjongBridge {
                 kyoku_first: None,
                 aka_flag: None,
                 id: Some(my_actor),
-                num_players: n,
-                game_meta: None,
-            });
+                num_players: n,            });
             self.game_open = true;
         }
         events.push(MjaiEvent::StartKyoku {
@@ -308,9 +306,7 @@ impl HoloMahjongBridge {
                 kyoku_first: None,
                 aka_flag: None,
                 id: Some(r.my_actor),
-                num_players: n,
-                game_meta: None,
-            });
+                num_players: n,            });
             self.game_open = true;
         }
         info!(

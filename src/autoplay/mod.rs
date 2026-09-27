@@ -72,6 +72,7 @@ pub mod majsoul;
 pub mod manager;
 pub mod platform;
 pub mod riichi_city;
+pub mod session;
 pub mod table;
 pub mod tenhou;
 pub mod tenhou_state;

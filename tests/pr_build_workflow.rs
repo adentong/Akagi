@@ -1,8 +1,15 @@
 const WORKFLOW: &str = include_str!("../.github/workflows/pr-build.yml");
 
+/// The workflow as checked in uses LF; a Windows checkout may hand us CRLF,
+/// which would make the newline-anchored matches below fail. Normalize.
+fn workflow() -> String {
+    WORKFLOW.replace("\r\n", "\n")
+}
+
 #[test]
 fn pr_build_comment_job_uses_pull_request_write_permission() {
-    let (_, comment_job) = WORKFLOW
+    let workflow = workflow();
+    let (_, comment_job) = workflow
         .split_once("\n  comment:\n")
         .expect("PR build workflow must contain a comment job");
 
@@ -18,6 +25,7 @@ fn pr_build_comment_job_uses_pull_request_write_permission() {
 
 #[test]
 fn pr_build_avoids_actions_with_node20_runtimes() {
+    let workflow = workflow();
     for deprecated in [
         "actions/github-script@v7",
         "actions/checkout@v4",
@@ -27,7 +35,7 @@ fn pr_build_avoids_actions_with_node20_runtimes() {
         "arduino/setup-protoc@v3",
     ] {
         assert!(
-            !WORKFLOW.contains(deprecated),
+            !workflow.contains(deprecated),
             "{deprecated} still uses the deprecated Node 20 action runtime"
         );
     }

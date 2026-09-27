@@ -771,7 +771,6 @@ mod tests {
             click_hold_ms: crate::config::MsRange::fixed(0),
             verify_input_ms: crate::config::MsRange::fixed(0),
             click_retries: 0,
-            reload_after_failures: 0,
             dealer_first_discard_extra_delay_ms: crate::config::MsRange::fixed(0),
         }
     }

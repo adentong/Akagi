@@ -812,6 +812,7 @@ mod tests {
                 Ok(BotResponse {
                     action: MjaiEvent::None,
                     meta: None,
+                    own_tsumo_seq: None,
                 })
             } else {
                 Ok(q.remove(0))
@@ -1318,6 +1319,7 @@ mod tests {
         let scripted = BotResponse {
             action: dahai(2),
             meta: None,
+            own_tsumo_seq: None,
         };
         let (mut mgr, _, mut rx, _, _) = manager_with_mock(vec![scripted.clone()]);
         mgr.handle(dahai(0)).await.unwrap(); // others' dahai → flush
@@ -1406,9 +1408,7 @@ mod tests {
                 kyoku_first: None,
                 aka_flag: None,
                 id: Some(0),
-                num_players: 4,
-                game_meta: None,
-            })
+                num_players: 4,            })
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("not found in registry"));
@@ -1464,9 +1464,7 @@ mod tests {
                 kyoku_first: None,
                 aka_flag: None,
                 id: Some(0),
-                num_players: 4,
-                game_meta: None,
-            })
+                num_players: 4,            })
             .await
             .unwrap_err();
         // The spawn must have been attempted for the *new* bot, not the
@@ -1547,9 +1545,7 @@ mod tests {
                 kyoku_first: None,
                 aka_flag: None,
                 id: Some(0),
-                num_players: 4,
-                game_meta: None,
-            })
+                num_players: 4,            })
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -1615,9 +1611,7 @@ mod tests {
             kyoku_first: None,
             aka_flag: None,
             id: Some(0),
-            num_players: 4,
-            game_meta: None,
-        })
+            num_players: 4,        })
         .await
         .expect("handle returns Ok (analysis-only), not an error");
 
@@ -1672,9 +1666,7 @@ mod tests {
             kyoku_first: None,
             aka_flag: None,
             id: Some(0),
-            num_players: 4,
-            game_meta: None,
-        })
+            num_players: 4,        })
         .await
         .expect("native bot must spawn without a Python runtime");
 
@@ -1728,6 +1720,7 @@ mod tests {
         BotResponse {
             action: MjaiEvent::Reach { actor, pai: None },
             meta: None,
+            own_tsumo_seq: None,
         }
     }
 
@@ -1739,6 +1732,7 @@ mod tests {
                 tsumogiri: false,
             },
             meta: None,
+            own_tsumo_seq: None,
         }
     }
 
@@ -1856,6 +1850,7 @@ mod tests {
                 pai: Some("3p".into()),
             },
             meta: None,
+            own_tsumo_seq: None,
         };
         let (mut mgr, calls, mut resp_rx, _, _) = manager_with_mock(vec![prefilled]);
         mgr.config.write().await.autoplay.enabled = true;

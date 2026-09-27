@@ -31,6 +31,14 @@ pub struct BotResponse {
     pub action: MjaiEvent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<serde_json::Value>,
+    /// Freshness tag for autoplay: the manager's count of our-seat
+    /// `tsumo` events at the moment this response was computed. A
+    /// mismatch against autoplay's own count means a newer draw
+    /// superseded the decision (e.g. responses queued behind a
+    /// reconnect's state-restore replay) and the response must not be
+    /// acted on. Absent on responses not tied to an own-turn draw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_tsumo_seq: Option<u64>,
 }
 
 #[cfg(test)]
@@ -83,6 +91,7 @@ mod tests {
                 tsumogiri: true,
             },
             meta: None,
+            own_tsumo_seq: None,
         };
         let out = serde_json::to_string(&resp).unwrap();
         assert!(

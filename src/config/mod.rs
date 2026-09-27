@@ -12,6 +12,7 @@ mod range;
 
 pub use autoplay::{
     AutoplayConfig, DelayDistribution, DelayMode, DelayModelConfig, MajsoulAutoplayConfig,
+    RiichiCityAutoplayConfig, RiichiGameType, RiichiRoom,
 };
 pub use bot::{BotConfig, NativeApiConfig};
 pub use capture::{CaptureConfig, CaptureMode, ChromiumConfig, HttpCaptureConfig};

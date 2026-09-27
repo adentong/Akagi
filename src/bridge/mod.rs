@@ -140,13 +140,13 @@ pub fn for_platform(
                 .with_input_watch(hooks.input_watch),
         ),
         crate::config::Platform::Tenhou => Box::new(
-            TenhouBridge::new(flow_log, session)
+            TenhouBridge::new(session)
                 .with_shared_state(hooks.tenhou_state)
                 .with_notify(hooks.notify)
                 .with_journal(hooks.tenhou_journal),
         ),
         crate::config::Platform::RiichiCity => {
-            Box::new(RiichiCityBridge::new(flow_log, session).with_inject(hooks.riichi_inject))
+            Box::new(RiichiCityBridge::new(session).with_inject(hooks.riichi_inject))
         }
         crate::config::Platform::HoloMahjong => Box::new(HoloMahjongBridge::new(flow_log, session)),
     }

@@ -92,7 +92,8 @@ Bridges must not log payloads of frames off the list themselves; see
   implements `build` in the other direction — not on the autoplay path, which
   drives the client's own input instead. See `tenhou/README.md`.
 - `riichi_city/` — Riichi City (JSON inside a 15-byte binary header).
-  Observe-only. See `riichi_city/README.md`.
+  Autoplay is supported by injecting client frames over the MITM proxy.
+  See `riichi_city/README.md`.
 - `holomahjong/` — HoloMahjong (MagicOnion StreamingHub messages, MessagePack
   over gRPC on cleartext HTTP/2). The proxy relays and taps its tunnels
   itself; `parse` receives one hub message per call. Observe-only. See

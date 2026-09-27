@@ -269,7 +269,6 @@ mod tests {
             aka_flag: None,
             id,
             num_players,
-            game_meta: None,
         }
     }
 
