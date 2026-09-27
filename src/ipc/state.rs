@@ -15,17 +15,13 @@
 //! follow-up `get_status` is always consistent with the action that just
 //! succeeded.
 
-use crate::analysis::runner::AnalysisCache;
 use crate::autoplay::AutoplayContext;
 use crate::bot::PythonRuntime;
 use crate::config::AppConfig;
 use crate::event_bus::{
-    AnalysisBus, BotResponseBus, BotStatusBus, CaptureStatusBus, HistoryBus, MjaiBus, NotifyBus,
-    PostTrackerBus,
+    BotResponseBus, BotStatusBus, CaptureStatusBus, MjaiBus, NotifyBus, PostTrackerBus,
 };
 use crate::game_state::GameTracker;
-use crate::history::recorder::SharedPlatform;
-use crate::history::HistoryStore;
 use crate::logger::Session;
 use crate::schema::{BotStatus, CaptureStatus};
 use std::collections::HashSet;
@@ -75,26 +71,13 @@ pub struct AppState {
     pub bot_status_bus: BotStatusBus,
     pub capture_status_bus: CaptureStatusBus,
     pub notify_bus: NotifyBus,
-    pub analysis_bus: AnalysisBus,
-    pub history_bus: HistoryBus,
 
     /// Latest BotStatus seen on the bus. Forwarder writes; commands read.
     pub bot_status: Arc<RwLock<BotStatus>>,
     pub capture_control: Arc<Mutex<CaptureControl>>,
-    /// Live game-state mirror. Future IPC commands lock this and call
-    /// `snapshot()` to expose hands/scores/dora to the frontend.
+    /// Live game-state mirror. Autoplay and the bot read this to reason
+    /// about the current hand.
     pub game_tracker: Arc<Mutex<GameTracker>>,
-    /// Latest analysis result, populated by the analysis runner. Read by
-    /// the `get_analysis` Tauri command for one-shot queries.
-    pub analysis_cache: AnalysisCache,
-    /// Persistent game-history store. Written by the recorder task,
-    /// read by `list_game_history` / `get_game_history_*` IPC commands.
-    pub history_store: Arc<HistoryStore>,
-    /// Shared cell holding the platform tag the history recorder stamps
-    /// onto each finalised game. `update_config` updates this when the
-    /// user switches bridges so subsequent records pick up the new tag
-    /// without a relaunch.
-    pub history_platform: SharedPlatform,
 
     /// Bundled-or-system Python + uv. `None` on dev boxes lacking both —
     /// install/sync commands surface a friendly error instead of panicking.
@@ -145,12 +128,7 @@ impl AppState {
         bot_status_bus: BotStatusBus,
         capture_status_bus: CaptureStatusBus,
         notify_bus: NotifyBus,
-        analysis_bus: AnalysisBus,
-        history_bus: HistoryBus,
         game_tracker: Arc<Mutex<GameTracker>>,
-        analysis_cache: AnalysisCache,
-        history_store: Arc<HistoryStore>,
-        history_platform: SharedPlatform,
         runtime: Option<PythonRuntime>,
     ) -> Self {
         Self {
@@ -163,14 +141,9 @@ impl AppState {
             bot_status_bus,
             capture_status_bus,
             notify_bus,
-            analysis_bus,
-            history_bus,
             bot_status: Arc::new(RwLock::new(BotStatus::Idle)),
             capture_control: Arc::new(Mutex::new(CaptureControl::default())),
             game_tracker,
-            analysis_cache,
-            history_store,
-            history_platform,
             runtime,
             syncs_in_flight: Arc::new(Mutex::new(HashSet::new())),
             bot_manager_started: Arc::new(AtomicBool::new(false)),

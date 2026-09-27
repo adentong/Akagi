@@ -140,7 +140,8 @@ fn is_autoplay_target_url(ws_url: &str) -> bool {
 
 /// Run the CDP loop until the browser disconnects or an unrecoverable
 /// error occurs. Frames flow through `bridges` into `mjai_bus`, and each
-/// frame is also recorded into `inspector` for the Logs → Inspector tab.
+/// frame is also recorded into `inspector` (the session's
+/// `inspector.jsonl`).
 ///
 /// `autoplay` is `Some` only on the chromium backend when the autoplay
 /// feature is wired (`AppState.autoplay_context`). On Majsoul WS open

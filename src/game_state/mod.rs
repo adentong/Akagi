@@ -9,13 +9,9 @@
 //! See `README.md` in this directory for the contributor-facing guide.
 
 pub mod convert;
-pub mod mahgen_view;
-pub mod score;
 pub mod snapshot;
 pub mod tracker;
 
-pub use mahgen_view::{MahgenView, PlayerMahgenView};
-pub use score::{calculate_score, is_tenpai, waits_for, Score};
 pub use snapshot::{
     DiscardEntry, GameStateSnapshot, MeldKind, MeldSnapshot, Phase, PlayerSnapshot,
 };

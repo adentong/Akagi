@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
-import { ChevronLeft, Megaphone, X } from 'lucide-react'
+import { ChevronLeft, X } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -19,7 +19,6 @@ import { AKAGI_GITHUB_URL, AKAGI_DISCORD_URL, AKAGIMS_GITHUB_URL, openExternal }
 import { getAppVersion, VERSION_FALLBACK } from '@/lib/appVersion'
 import { LANG_LABELS, SUPPORTED_LANGS, type SupportedLang } from '@/i18n'
 import { selectHasNotifiableUpdate, useUpdaterStore } from '@/stores/updaterStore'
-import { useAnnouncementStore } from '@/stores/announcementStore'
 import { Menu } from './Menu'
 
 export function Sidebar() {
@@ -66,8 +65,8 @@ export function Sidebar() {
 
   // `open` includes the transient hover-open state. Only `isOpen` (pinned)
   // affects main content margin in App.tsx — hover-open expands the sidebar
-  // visually as an overlay above main, so width-sensitive widgets like
-  // react-grid-layout don't thrash on every cursor pass.
+  // visually as an overlay above main, so width-sensitive widgets don't
+  // re-flow on every cursor pass.
   //
   // As a drawer it is always fully expanded: a 5.625rem rail of bare icons is
   // a pointless middle state for something that's already an overlay.
@@ -156,10 +155,10 @@ export function Sidebar() {
             ))}
         </div>
         <Menu isOpen={open} />
-        {/* Footer icon row — announcements plus the GitHub / Discord /
-            AkagiMS links. Always rendered, even when collapsed, so all
-            stay reachable in both states. The version + language picker
-            rides along below it but only when there's room (open state). */}
+        {/* Footer icon row — the GitHub / Discord / AkagiMS links. Always
+            rendered, even when collapsed, so all stay reachable in both
+            states. The version + language picker rides along below it but
+            only when there's room (open state). */}
         <div
           className={cn(
             // flex-wrap: the collapsed rail (5.625rem) fits two icon
@@ -168,13 +167,6 @@ export function Sidebar() {
             open ? 'justify-start px-1' : 'justify-center',
           )}
         >
-          <SidebarIconButton
-            label={t('sidebar.announcements')}
-            collapsed={!open}
-            onClick={() => useAnnouncementStore.getState().openHistory()}
-          >
-            <Megaphone className="h-4 w-4" />
-          </SidebarIconButton>
           <SidebarIconButton
             label="GitHub"
             collapsed={!open}

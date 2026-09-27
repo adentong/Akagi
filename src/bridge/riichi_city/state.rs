@@ -30,7 +30,7 @@ pub struct GameStatus {
     pub shift: i64,
     /// Matchmaking classification id from `cmd_enter_room.options` (a wire
     /// string of ~22 base32-ish chars). Names the queue class — repeats
-    /// across games in the same room tier. Persisted into `MatchInfo`.
+    /// across games in the same room tier.
     pub classify_id: Option<String>,
     /// Table-instance token from the `cmd_enter_room` wrapper (`room_id`).
     /// Unique per table, so it (not `classify_id`) keys the duplicate-

@@ -37,6 +37,7 @@ use crate::bot::registry::BotRegistry;
 use crate::bot::runner::{BotRunner, SubprocessBot};
 use crate::bot::runtime::PythonRuntime;
 use crate::bot::sync_guard::SyncGuard;
+use crate::bot::types::BotResponse;
 use crate::config::AppConfig;
 use crate::event_bus::{BotResponseBus, BotStatusBus, NotifyBus, TrackedEvent};
 use crate::inspector::InspectorWriter;
@@ -85,17 +86,28 @@ pub struct BotManager {
     /// [`Self::handle_tracked`]) has already fed this runner a synthetic
     /// `reach` to resolve the declaring discard; the bridge's later real
     /// reach echo for the same declaration would otherwise be a *second*
-    /// `reach` and desync a stateful bot. The tracker and history still see
-    /// the echo on their own bus subscriptions — only the runner's view is
+    /// `reach` and desync a stateful bot. The tracker still sees
+    /// the echo on its own bus subscription — only the runner's view is
     /// deduplicated. Cleared when consumed, or on any kyoku/game boundary so
     /// a lost declaration (whose echo never arrives) can't leak the flag
     /// into the next hand.
     drop_next_own_reach: bool,
+    /// Batch-drain flag (see `run`): while set, `handle_tracked` defers
+    /// its react and records the newest decision-triggering event here.
+    defer_react: bool,
+    /// The event that crossed the decision-point threshold while
+    /// deferring — what `react_to_decision` will be called with.
+    react_owed_event: Option<MjaiEvent>,
+    /// Monotonic count of our-seat `tsumo` events seen this session —
+    /// the freshness tag stamped onto responses (see `BotResponse`).
+    /// Never reset: autoplay maintains the same count over the same bus
+    /// stream, and only the difference between the two matters.
+    own_tsumo_seq: u64,
     out_tx: BotResponseBus,
     status_tx: BotStatusBus,
     notify_tx: NotifyBus,
     /// Inspector writer — one BotReaction record per `react()` call, so
-    /// the Logs → Inspector tab can replay "trigger event → bot action"
+    /// the inspector timeline can replay "trigger event → bot action"
     /// pairings without grepping multiple files.
     inspector: InspectorWriter,
     /// Shared with the IPC layer so a user-triggered Reinstall environment
@@ -126,6 +138,9 @@ impl BotManager {
             pending: Vec::new(),
             actor_id: None,
             drop_next_own_reach: false,
+            own_tsumo_seq: 0,
+            defer_react: false,
+            react_owed_event: None,
             out_tx,
             status_tx,
             notify_tx,
@@ -157,11 +172,41 @@ impl BotManager {
         loop {
             match rx.recv().await {
                 Ok(ev) => {
-                    if let Err(e) = self.handle_tracked(ev).await {
-                        error!("bot manager: {e:#}");
-                        // Tear the runner down; next start_game will respawn.
-                        self.runner = None;
-                        self.pending.clear();
+                    // Batch-drain: coalesce everything already queued
+                    // before reacting. In steady state the queue holds at
+                    // most the current event (no behavior change); a
+                    // burst — a reconnect's state-restore replaying a
+                    // whole hand — collapses into ONE react against the
+                    // freshest state instead of one bot inference per
+                    // superseded turn.
+                    let mut burst = vec![ev];
+                    while let Ok(more) = rx.try_recv() {
+                        burst.push(more);
+                    }
+                    self.defer_react = true;
+                    let mut failed = None;
+                    for tracked in burst {
+                        if let Err(e) = self.handle_tracked(tracked).await {
+                            error!("bot manager: {e:#}");
+                            // Tear the runner down; next start_game will
+                            // respawn.
+                            self.runner = None;
+                            self.pending.clear();
+                            failed = Some(());
+                            break;
+                        }
+                    }
+                    self.defer_react = false;
+                    if failed.is_none() {
+                        if let Some(event) = self.react_owed_event.take() {
+                            if let Err(e) = self.react_to_decision(event).await {
+                                error!("bot manager: {e:#}");
+                                self.runner = None;
+                                self.pending.clear();
+                            }
+                        }
+                    } else {
+                        self.react_owed_event = None;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -246,8 +291,7 @@ impl BotManager {
         // Deduplicate the bridge's own-seat reach echo when an autoplay
         // follow-up already fed this runner a synthetic reach for the same
         // declaration (see the follow-up below and #257). Only the runner's
-        // view is affected; the tracker/history saw the echo on their own
-        // subscriptions.
+        // view is affected; the tracker saw the echo on its own subscription.
         if self.drop_next_own_reach {
             if let MjaiEvent::Reach { actor, .. } = &event {
                 if Some(*actor) == self.actor_id {
@@ -261,6 +305,15 @@ impl BotManager {
             }
         }
 
+        // Freshness tag bookkeeping: count our-seat draws as they arrive,
+        // so responses computed from an older draw can be recognized (and
+        // dropped) by autoplay once a newer one has been seen.
+        if let MjaiEvent::Tsumo { actor, .. } = &event {
+            if Some(*actor) == self.actor_id {
+                self.own_tsumo_seq += 1;
+            }
+        }
+
         self.pending.push(event.clone());
 
         if !self.is_decision_point(&event, can_act) {
@@ -270,6 +323,24 @@ impl BotManager {
         // Read once, before borrowing the runner: whether autoplay is on
         // gates the reach follow-up below. Runtime-toggled — the same flag
         // the autoplay manager re-reads on every response.
+        // Batch-drain: when the caller is coalescing a burst (see `run`),
+        // defer the react to the end of the burst — a reconnect's
+        // state-restore replay would otherwise be answered one superseded
+        // turn at a time, each ~a bot-inference slow, and the answers
+        // pile up behind the backlog (observed live: 5.5s of serialized
+        // reactions, the real decision answered too late for its window).
+        if self.defer_react {
+            self.react_owed_event = Some(event);
+            return Ok(());
+        }
+        self.react_to_decision(event).await
+    }
+
+    /// The react half of [`Self::handle_tracked`]: one bot query for the
+    /// accumulated batch, the reach follow-up, the inspector record, and
+    /// the publish. Split out so `run` can drain a burst first and react
+    /// exactly once — to the freshest state.
+    async fn react_to_decision(&mut self, event: MjaiEvent) -> Result<()> {
         let autoplay_enabled = self.config.read().await.autoplay.enabled;
         let our_seat = self.actor_id;
 
@@ -279,6 +350,7 @@ impl BotManager {
             .expect("runner is Some — checked above");
         let batch = std::mem::take(&mut self.pending);
         let started = Instant::now();
+        let seq_at_query = self.own_tsumo_seq;
         let mut resp = match runner.react(&batch).await {
             Ok(r) => r,
             Err(e) => {
@@ -370,7 +442,12 @@ impl BotManager {
         }
         // MjaiEvent::None still goes on the bus — downstream consumers
         // decide whether to render. Centralizes the "skip" decision.
-        let _ = self.out_tx.send(resp);
+        // The freshness tag rides along: the draw count as of the query
+        // that produced this response.
+        let _ = self.out_tx.send(BotResponse {
+            own_tsumo_seq: Some(seq_at_query),
+            ..resp
+        });
 
         if matches!(event, MjaiEvent::EndGame { .. }) {
             // Drain runner cleanly (writes end_game to stdin internally
@@ -772,6 +849,7 @@ mod tests {
                 Ok(BotResponse {
                     action: MjaiEvent::None,
                     meta: None,
+                    own_tsumo_seq: None,
                 })
             } else {
                 Ok(q.remove(0))
@@ -816,7 +894,7 @@ mod tests {
     fn dummy_inspector() -> InspectorWriter {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         let path = tmp.into_temp_path().keep().unwrap();
-        InspectorWriter::open(&path, 8).unwrap().0
+        InspectorWriter::open(&path).unwrap()
     }
 
     // Test-only helper; the 5-tuple return groups the manager with the
@@ -1204,12 +1282,21 @@ mod tests {
         let scripted = BotResponse {
             action: dahai(2),
             meta: None,
+            own_tsumo_seq: None,
         };
         let (mut mgr, _, mut rx, _, _) = manager_with_mock(vec![scripted.clone()]);
         mgr.handle(dahai(0)).await.unwrap(); // others' dahai → flush
 
         let received = rx.try_recv().expect("bot response should be broadcast");
-        assert_eq!(received, scripted);
+        // The manager stamps the freshness tag on publish: no our-seat
+        // draw was seen in this test, so the count is zero.
+        assert_eq!(
+            received,
+            BotResponse {
+                own_tsumo_seq: Some(0),
+                ..scripted
+            }
+        );
     }
 
     #[tokio::test]
@@ -1293,7 +1380,6 @@ mod tests {
                 aka_flag: None,
                 id: Some(0),
                 num_players: 4,
-                game_meta: None,
             })
             .await
             .unwrap_err();
@@ -1351,7 +1437,6 @@ mod tests {
                 aka_flag: None,
                 id: Some(0),
                 num_players: 4,
-                game_meta: None,
             })
             .await
             .unwrap_err();
@@ -1434,7 +1519,6 @@ mod tests {
                 aka_flag: None,
                 id: Some(0),
                 num_players: 4,
-                game_meta: None,
             })
             .await
             .unwrap_err();
@@ -1502,7 +1586,6 @@ mod tests {
             aka_flag: None,
             id: Some(0),
             num_players: 4,
-            game_meta: None,
         })
         .await
         .expect("handle returns Ok (analysis-only), not an error");
@@ -1559,7 +1642,6 @@ mod tests {
             aka_flag: None,
             id: Some(0),
             num_players: 4,
-            game_meta: None,
         })
         .await
         .expect("native bot must spawn without a Python runtime");
@@ -1614,6 +1696,7 @@ mod tests {
         BotResponse {
             action: MjaiEvent::Reach { actor, pai: None },
             meta: None,
+            own_tsumo_seq: None,
         }
     }
 
@@ -1625,6 +1708,7 @@ mod tests {
                 tsumogiri: false,
             },
             meta: None,
+            own_tsumo_seq: None,
         }
     }
 
@@ -1742,6 +1826,7 @@ mod tests {
                 pai: Some("3p".into()),
             },
             meta: None,
+            own_tsumo_seq: None,
         };
         let (mut mgr, calls, mut resp_rx, _, _) = manager_with_mock(vec![prefilled]);
         mgr.config.write().await.autoplay.enabled = true;

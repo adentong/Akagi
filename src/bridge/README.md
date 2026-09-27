@@ -8,12 +8,14 @@ consumed by AI bots.
 
 ```rust
 pub trait Bridge: Send {
-    fn parse(&mut self, content: &[u8]) -> Vec<MjaiEvent>;
+    fn parse(&mut self, direction: Direction, content: &[u8]) -> ParseResult;
     fn build(&mut self, command: &MjaiEvent) -> Option<Vec<u8>>;
 }
 ```
 
-- `parse` — raw inbound WS binary frame → zero or more `MjaiEvent`s.
+- `parse` — raw WS binary frame → zero or more `MjaiEvent`s plus the
+  bridge's first-pass structured view of the frame (`ParseResult`), which
+  the inspector timeline records.
 - `build` — outbound mjai command (also `MjaiEvent`) → optional raw WS binary frame (autoplay).
 
 ## mjai types
@@ -36,15 +38,17 @@ is isolated.
 ## `BridgeHooks`
 
 Shared slots the autoplay layer hands to a bridge. Every field is optional and
-platform-specific, and only the chromium capture path wires them at all — the
-MITM path has no `Page` handle, so nothing consumes them. They exist because
-autoplay needs facts only the protocol parser sees:
+platform-specific; each capture path wires the subset its platform needs (the
+MITM path wires Riichi City's injection gate, the chromium path the rest).
+They exist because autoplay needs facts only the protocol parser sees:
 
 | Field | Platform | Carries |
 |---|---|---|
 | `time_budget` | Majsoul | The server's per-decision-window time grant (`OptionalOperationList.time_fixed/time_add`). |
 | `input_watch` | Majsoul | A counter of the client's own uplink input commands, so a click can be told from one the UI swallowed. |
 | `tenhou_state` | Tenhou | The hand at Tenhou tile-index resolution plus the current decision window — what makes a client frame encodable. |
+| `riichi_inject` | Riichi City | The frame-injection gate: in-game flag, decision window, injected-frame relay. |
+| `notify` | Tenhou | Toast channel for states no mjai event can carry (a mid-hand rejoin). |
 
 Bundled into one struct so adding a platform's slot doesn't grow the argument
 list of every constructor between here and the capture backend.
@@ -70,4 +74,5 @@ list of every constructor between here and the capture backend.
   implements `build` in the other direction — not on the autoplay path, which
   drives the client's own input instead. See `tenhou/README.md`.
 - `riichi_city/` — Riichi City (JSON inside a 15-byte binary header).
-  Observe-only. See `riichi_city/README.md`.
+  Autoplay is supported by injecting client frames over the MITM proxy.
+  See `riichi_city/README.md`.

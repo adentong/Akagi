@@ -3,8 +3,7 @@
 `crate::capture` is the transport layer that supplies binary WebSocket
 frames to `crate::bridge::Bridge` (the protocol parser). Two backends
 share one trait so the rest of the app — bot manager, game tracker,
-analysis runner, IPC forwarders — never sees which capture mode is
-running.
+IPC forwarders — never sees which capture mode is running.
 
 ## Backends
 
@@ -103,21 +102,9 @@ Chrome-for-Testing install, etc.):
   first, with an AppImage / user-config fallback baked in. This keeps
   the portable zip distribution single-folder: the chrome profile and
   the downloaded CfT browser sit next to the binary alongside `logs/`,
-  `history/`, `ca/`, `mjai_bot/`, so moving / backing up / removing the
+  `ca/`, `mjai_bot/`, so moving / backing up / removing the
   app is one folder operation.
-- `crate::util::user_subdir(name)` is still available for callers that
-  *must* use the OS user-config dir regardless of where the binary
-  lives. None of the capture code currently needs that — `resolve_dir`
-  already routes to user-config under AppImage and similar read-only
-  mounts.
-
-## Phasing
-
-Phase 1 (this commit): trait, system Chrome detect, basic CDP frame
-capture, supervisor multiplexing, Settings UI toggle.
-
-Phase 2 (planned): Chrome-for-Testing manifest fetch + download +
-extract, macOS quarantine strip, Windows + macOS smoke testing.
-
-Phase 3 (planned): first-run wizard, `Snapshot.capture_status`
-migration, removal of `start_proxy`/`stop_proxy` aliases.
+- `crate::util::user_config_root()` resolves the OS user-config root for
+  callers that must use it regardless of where the binary lives (the
+  `resolve_dir` fallback already routes there under AppImage and similar
+  read-only mounts).

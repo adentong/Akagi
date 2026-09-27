@@ -28,9 +28,8 @@
 
 use crate::event_bus::TrackedEvent;
 use crate::game_state::convert;
-use crate::game_state::score::{evaluate_hora_3p, evaluate_hora_4p};
 use crate::game_state::snapshot::GameStateSnapshot;
-use crate::schema::{HoraScoreInfo, MjaiEvent as AkagiEvent};
+use crate::schema::MjaiEvent as AkagiEvent;
 use anyhow::Result;
 use riichienv_core::rule::GameRule;
 use riichienv_core::state::legal_actions::GameStateLegalActions;
@@ -169,19 +168,18 @@ impl GameTracker {
                     apply_ippatsu_patch_4p(s, ev);
                     // riichienv-core drops the naki `target`, storing the new
                     // meld with `from_who = -1`; patch it back so the meld
-                    // renders rotated toward the real discarder (see
-                    // `mahgen_view::call_side`).
+                    // points at the real discarder.
                     if let Some((actor, target)) = meld_target(ev) {
                         if let Some(m) = s.players.get_mut(actor).and_then(|p| p.melds.last_mut()) {
                             m.from_who = target;
                         }
                     }
+                    if let AkagiEvent::Dahai { actor, pai, .. } = ev {
+                        open_haitei_claims(s, *actor, pai);
+                    }
                     // Runs after `apply_ippatsu_patch_4p`, which has already
                     // retired every ippatsu window (a kakan is a call) — the
-                    // live path checks chankan with ippatsu still up. Harmless
-                    // for the window itself (chankan is a yaku, so han >= 1
-                    // regardless); only `evaluate_hora`'s preview of an
-                    // ippatsu-plus-chankan ron loses that han.
+                    // live path checks chankan with ippatsu still up.
                     if let Some((actor, pai, seat)) = &opponent_kakan {
                         native_bot::chankan::open_on_kakan(s, *actor, pai, *seat);
                     }
@@ -206,6 +204,9 @@ impl GameTracker {
                         if let Some(m) = s.players.get_mut(actor).and_then(|p| p.melds.last_mut()) {
                             m.from_who = target;
                         }
+                    }
+                    if let AkagiEvent::Dahai { actor, pai, .. } = ev {
+                        open_haitei_claims_3p(s, *actor, pai);
                     }
                     // Same ippatsu-ordering caveat as the 4p arm above.
                     if let Some((actor, pai, seat)) = &opponent_kakan {
@@ -234,18 +235,6 @@ impl GameTracker {
     /// `Some(num_players)` if a game is in progress.
     pub fn num_players(&self) -> Option<u8> {
         self.state.as_ref().map(|tg| tg.num_players())
-    }
-
-    /// Score a hypothetical hora by `actor` against the live engine state.
-    /// Returns `None` when no game is in progress, the hand isn't a winning
-    /// shape, or the winning tile can't be inferred (no recent draw / discard).
-    /// Routes to the 4p or 3p evaluator based on the active engine.
-    pub fn evaluate_hora(&self, actor: u8, is_tsumo: bool) -> Option<HoraScoreInfo> {
-        match &self.state {
-            Some(TrackedGame::Four(s)) => evaluate_hora_4p(s, actor, is_tsumo),
-            Some(TrackedGame::Three(s)) => evaluate_hora_3p(s, actor, is_tsumo),
-            None => None,
-        }
     }
 
     /// Borrow the live engine state. Returns `None` for non-4p games or no
@@ -315,9 +304,8 @@ impl Default for GameTracker {
 /// for every other event, including ankan / kakan (no external claim).
 ///
 /// riichienv-core 0.4.8's `apply_mjai_event` ignores the mjai `target` field
-/// and stores these melds with `from_who = -1`, which `mahgen_view::call_side`
-/// treats as a kamicha default — so every open meld would render rotated to the
-/// left regardless of who was called. The tracker re-applies `target` after
+/// and stores these melds with `from_who = -1`, so every open meld would
+/// point at the wrong player. The tracker re-applies `target` after
 /// the event so the meld points at the real discarder.
 fn meld_target(ev: &AkagiEvent) -> Option<(usize, i8)> {
     match ev {
@@ -328,14 +316,87 @@ fn meld_target(ev: &AkagiEvent) -> Option<(usize, i8)> {
     }
 }
 
+/// riichienv-core 0.4.8 gates chi/pon/kan detection on
+/// `wall.drawable_count > 0`, a stricter variant than Riichi City plays:
+/// on a live 2026-08-24 capture the server offered a chi on the haitei
+/// discard (the last live-wall tile) and the claim window timed out
+/// because the engine's empty claim set made `can_act` false — the bot
+/// was never asked. Re-run the engine's own claim detection with the
+/// gate satisfied — restoring the wall immediately after, since the ron
+/// arm already ran during apply with the true haitei conditions — and
+/// splice only the chi/pon claims back in (kan at an empty live wall is
+/// left to the engine's own judgment).
+fn open_haitei_claims(s: &mut GameState, discarder: u8, pai: &str) {
+    use riichienv_core::action::{ActionType, Phase};
+    if s.wall.drawable_count != 0 || s.phase != Phase::WaitAct {
+        return;
+    }
+    let Some(tile) = riichienv_core::parser::mjai_to_tid(pai) else {
+        return;
+    };
+    s.wall.drawable_count = 1;
+    let mut claimants = Vec::new();
+    for i in 0..s.players.len() as u8 {
+        if i == discarder {
+            continue;
+        }
+        let (legals, _) = s._get_claim_actions_for_player(i, discarder, tile);
+        let calls: Vec<_> = legals
+            .into_iter()
+            .filter(|a| matches!(a.action_type, ActionType::Chi | ActionType::Pon))
+            .collect();
+        if !calls.is_empty() {
+            s.current_claims.insert(i, calls);
+            claimants.push(i);
+        }
+    }
+    s.wall.drawable_count = 0;
+    if !claimants.is_empty() {
+        s.phase = Phase::WaitResponse;
+        s.active_players = claimants;
+    }
+}
+
+/// Sanma twin of [`open_haitei_claims`]: pon (there is no chi in sanma)
+/// on the last live-wall discard, same engine gate, same live incident
+/// class.
+fn open_haitei_claims_3p(s: &mut GameState3P, discarder: u8, pai: &str) {
+    use riichienv_core::action::{ActionType, Phase};
+    if s.wall.drawable_count != 0 || s.phase != Phase::WaitAct {
+        return;
+    }
+    let Some(tile) = riichienv_core::parser::mjai_to_tid(pai) else {
+        return;
+    };
+    s.wall.drawable_count = 1;
+    let mut claimants = Vec::new();
+    for i in 0..s.players.len() as u8 {
+        if i == discarder {
+            continue;
+        }
+        let (legals, _) = s._get_claim_actions_for_player(i, discarder, tile);
+        let calls: Vec<_> = legals
+            .into_iter()
+            .filter(|a| matches!(a.action_type, ActionType::Chi | ActionType::Pon))
+            .collect();
+        if !calls.is_empty() {
+            s.current_claims.insert(i, calls);
+            claimants.push(i);
+        }
+    }
+    s.wall.drawable_count = 0;
+    if !claimants.is_empty() {
+        s.phase = Phase::WaitResponse;
+        s.active_players = claimants;
+    }
+}
+
 /// Maintain `players[].ippatsu_cycle` on the replay path.
 ///
 /// `apply_mjai_event(ReachAccepted)` in riichienv-core 0.4.8 leaves
 /// `ippatsu_cycle` untouched (only the live-engine `_accept_riichi` sets it
 /// to `true`). Without this patch, ippatsu is never detected when scoring
-/// against the tracker state — e.g. `evaluate_hora_4p` would miss the +1 han
-/// and the frontend's "+N points" display under-reports a riichi-ippatsu
-/// hand by exactly one fan band.
+/// against the tracker state.
 ///
 /// We mirror the live-engine ippatsu lifecycle:
 /// - `ReachAccepted`: open the window for the actor.
@@ -489,7 +550,6 @@ mod tests {
             aka_flag: None,
             id: Some(0),
             num_players: 4,
-            game_meta: None,
         }
     }
 
@@ -545,6 +605,49 @@ mod tests {
         }
     }
 
+    /// riichienv-core gates chi/pon on a non-empty live wall; Riichi City
+    /// offers them on the haitei discard too (live 2026-08-24 capture:
+    /// the server offered a chi on the very last live-wall tile and the
+    /// window timed out because the engine's empty claim set made
+    /// `can_act` false). The post-apply patch must splice those claims
+    /// back in — with the wall restored, so the false non-empty wall
+    /// doesn't leak into anything else.
+    #[test]
+    fn haitei_discard_still_offers_claims() {
+        use riichienv_core::action::Phase;
+        let mut t = GameTracker::new();
+        t.handle(&start_game()).unwrap();
+        // Our seat (0) holds 3m4m among others; seat 3 is our claim
+        // source ((3+1)%4 = 0).
+        t.handle(&start_kyoku_with_our_hand()).unwrap();
+        if let Some(TrackedGame::Four(s)) = t.state.as_mut() {
+            s.wall.drawable_count = 0;
+        }
+        t.handle(&dahai(3, "2m")).unwrap();
+        assert_eq!(
+            t.our_seat_can_act(),
+            Some(true),
+            "the chi on the haitei discard must be offered"
+        );
+        if let Some(TrackedGame::Four(s)) = t.state.as_ref() {
+            assert_eq!(s.wall.drawable_count, 0, "wall restored after the splice");
+            assert_eq!(s.phase, Phase::WaitResponse);
+        }
+        // And a tile we cannot use still yields nothing at haitei.
+        let mut t2 = GameTracker::new();
+        t2.handle(&start_game()).unwrap();
+        t2.handle(&start_kyoku_with_our_hand()).unwrap();
+        if let Some(TrackedGame::Four(s)) = t2.state.as_mut() {
+            s.wall.drawable_count = 0;
+        }
+        t2.handle(&dahai(3, "S")).unwrap();
+        assert_eq!(
+            t2.our_seat_can_act(),
+            Some(false),
+            "no pair, no run — nothing to claim"
+        );
+    }
+
     #[test]
     fn tracker_starts_empty() {
         let t = GameTracker::new();
@@ -566,7 +669,6 @@ mod tests {
             aka_flag: None,
             id: None, // observer / replay: no seat of ours
             num_players: 4,
-            game_meta: None,
         })
         .unwrap();
         assert_eq!(t.our_seat_can_act(), None, "no seat, no opinion");
@@ -796,7 +898,6 @@ mod tests {
             aka_flag: None,
             id: seat,
             num_players: 4,
-            game_meta: None,
         }
     }
 
@@ -867,7 +968,7 @@ mod tests {
 
     /// Regression: `riichienv-core 0.4.8::apply_mjai_event(Dahai)` does not
     /// populate `discard_from_hand` / `discard_is_riichi`, so the snapshot
-    /// fell back to defaults and the mahgen river rendered with no
+    /// fell back to defaults and the river lost its
     /// tedashi/tsumogiri/riichi markers. We patch the parallel arrays
     /// inside `handle()` — verify the snapshot exposes correct flags.
     #[test]
@@ -944,8 +1045,6 @@ mod tests {
     /// rendered river hides it while the analysis-facing entry is retained.
     #[test]
     fn pon_records_discarder_and_hides_called_tile() {
-        use crate::game_state::mahgen_view::MahgenView;
-
         let mut t = GameTracker::new();
         t.handle(&start_game()).unwrap(); // observer = seat 0
         t.handle(&start_kyoku(0)).unwrap();
@@ -981,21 +1080,12 @@ mod tests {
         );
 
         // Fix 2: seat 2's lone discard is flagged claimed but kept in the list
-        // so the analysis engine still sees it as genbutsu.
+        // so it still counts as genbutsu against that seat.
         assert_eq!(snap.players[2].river.len(), 1);
         assert!(
             snap.players[2].river[0].called,
             "claimed discard is retained but flagged"
         );
-
-        // The rendered strings reflect both fixes: pon rotated toward toimen
-        // (middle slot), discarder's river empty.
-        let view = MahgenView::from_snapshot(&snap);
-        assert_eq!(
-            view.players[0].melds[0], "1_11m",
-            "pon rotated toward toimen"
-        );
-        assert_eq!(view.players[2].river, "", "claimed tile hidden from river");
     }
 
     /// 3p `start_game` constructs a `GameState3P` and the snapshot reflects
@@ -1010,7 +1100,6 @@ mod tests {
             aka_flag: None,
             id: Some(1),
             num_players: 3,
-            game_meta: None,
         };
         t.handle(&ev).unwrap();
         assert!(t.state().is_none(), "state() returns None for 3p");

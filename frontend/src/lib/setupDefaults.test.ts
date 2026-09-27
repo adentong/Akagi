@@ -54,7 +54,6 @@ function makeConfig(over: {
         click_hold_ms: 0,
         verify_input_ms: 0,
         click_retries: 0,
-        reload_after_failures: 0,
         dealer_first_discard_extra_delay_ms: 0,
       },
       delay: {
@@ -70,6 +69,12 @@ function makeConfig(over: {
         bank_use_fraction: 0,
         bank_max_single_ms: 0,
         no_budget_cap_ms: 0,
+      },
+      riichi_city: {
+        room: 'star',
+        game_type: 'east_only',
+        galaxy_fallback_sun: false,
+        inter_game_delay_ms: 0,
       },
     },
     overlay: { enabled: true, top_n: 3, opacity: 1, always_on_top: true },

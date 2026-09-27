@@ -78,15 +78,6 @@ pub fn is_native(name: &str) -> bool {
     name == NATIVE_4P || name == NATIVE_3P
 }
 
-/// Display label for a reserved native-bot name, for the Bots UI.
-pub fn display_name(name: &str) -> Option<&'static str> {
-    match name {
-        NATIVE_4P => Some("Akagi (built-in, 4p)"),
-        NATIVE_3P => Some("Akagi (built-in, 3p)"),
-        _ => None,
-    }
-}
-
 /// Construct the built-in bot runner for a game of `num_players` seated at
 /// `actor_id`, holding `config` so `bot.api` can be re-read at each decision.
 ///
@@ -570,6 +561,7 @@ impl BotRunner for NativeBot {
             return Ok(BotResponse {
                 action: MjaiEvent::None,
                 meta: None,
+                own_tsumo_seq: None,
             });
         }
 
@@ -581,6 +573,7 @@ impl BotRunner for NativeBot {
                 return Ok(BotResponse {
                     action: MjaiEvent::None,
                     meta: None,
+                    own_tsumo_seq: None,
                 })
             }
         };
@@ -600,7 +593,11 @@ impl BotRunner for NativeBot {
         } else {
             local_reply(&local, self.seat)
         };
-        Ok(BotResponse { action, meta })
+        Ok(BotResponse {
+            action,
+            meta,
+            own_tsumo_seq: None,
+        })
     }
 
     async fn reset(&mut self) -> Result<()> {
@@ -668,11 +665,6 @@ fn local_reply(local: &Decision, seat: u8) -> (MjaiEvent, Option<Value>) {
 /// Shape the accumulated Akagi mjai stream into the API's expected JSON:
 /// censor other seats' hidden info to `?`, pad 3p `start_game`/`start_kyoku`
 /// arrays to length 4, strip player-count / predicted-reach extensions.
-///
-/// `pub(crate)` because the whole-game review submit
-/// (`crate::ipc::commands::native_api_review_history_game`) reuses it: a
-/// recorded history log is the same bridge stream this bot accumulates live,
-/// and `/v3/review` wants the identical censored perspective as `/v3/react`.
 pub(crate) fn build_api_events(stream: &[MjaiEvent], seat: u8, num_players: u8) -> Vec<Value> {
     stream
         .iter()
@@ -1087,7 +1079,6 @@ mod tests {
             aka_flag: None,
             id: Some(seat),
             num_players: 4,
-            game_meta: None,
         }
     }
 
@@ -1884,7 +1875,6 @@ mod tests {
             aka_flag: None,
             id: Some(0),
             num_players: 3,
-            game_meta: None,
         };
         let v = to_api_event(&sg, 0, 3);
         assert_eq!(v["names"].as_array().unwrap().len(), 4);

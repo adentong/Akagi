@@ -1,38 +1,44 @@
 # `src/autoplay/` — bot decisions → actions in the real client
 
 Translates the bot's chosen mjai action into something the game client
-actually does, dispatched over CDP. Only active when
-`autoplay.enabled = true` **and** the chromium capture backend is running
-(the MITM path has no page handle at all).
+actually does: synthesised CDP input for Mahjong Soul / Tenhou, or
+protocol frames injected into the MITM proxy connection for Riichi City.
+Only active when `autoplay.enabled = true`.
 
-Two very different routes in, decided by `platform.kind`:
+Three very different routes in, decided by `platform.kind`:
 
 | Platform | Route | Why |
 |---|---|---|
 | Mahjong Soul | synthesised mouse input at reconstructed coordinates | The client renders to a canvas and exposes nothing to script. |
 | Tenhou | the client's own DOM buttons and discard handler | The client is HTML and script, so its input path can be driven directly. |
+| Riichi City | the client's own protocol frames, sent through the proxy | Native client with no page handle; the bridge exposes an injection gate instead. |
 
 Almost everything intricate in this module — coordinate tables, candidate
-row index arithmetic, click verification, retries, page reloads — exists
-because of the first route. The Tenhou path needs none of it: it presses
-what the user would press, and an action that did not land says so. What
-both share is the delay model, because a decision executed the instant the
-bot answers is the most obvious tell there is.
+row index arithmetic, click verification, retries — exists because of the
+Majsoul route. The Tenhou path needs none of it: it presses what the user
+would press, and an action that did not land says so. Riichi City needs
+neither clicks nor coordinates, but does need the hand/window state the
+bridge publishes. What all routes share is the delay model, because a
+decision executed the instant the bot answers is the most obvious tell
+there is.
 
 ## Module map
 
 | Module | Role |
 |---|---|
-| `manager.rs` | Long-lived task: subscribes to `BotResponseBus` + `MjaiBus`, owns per-game state (`last_kawa_tile`, riichi flags, reach two-step), executes click plans. |
-| `platform.rs` | `PlatformAutoplay` trait + `ActionContext`/`PlanResult`/`Step` (`Click` / `Sleep` / `AwaitReady` / `DomClick` / `Discard`). The manager only knows this trait. |
+| `manager.rs` | Long-lived task: subscribes to `BotResponseBus` + `MjaiBus`, owns per-game state (`last_kawa_tile`, riichi flags, reach two-step), executes click plans or spawns frame-injection tasks. |
+| `platform.rs` | `PlatformAutoplay` trait + `ActionContext`/`PlanResult`/`Step` (`Click` / `Sleep` / `AwaitReady` / `DomClick` / `Discard` / `SendFrame`). The manager only knows this trait. |
 | `majsoul/` | The Majsoul implementation: 16:9 coordinate tables (`coords.rs`) + plan dispatch for every mjai action type. |
 | `tenhou/` | The Tenhou implementation: press the client's own action buttons (`Step::DomClick`) or call its discard handler with a tile index (`Step::Discard`). `tenhou/inject.rs` is what makes the latter reachable. |
+| `riichi_city/` | Frame-injection plans (`Step::SendFrame`), the settlement OK-button watcher (`round_advance.rs`) and its screen detector (`vision.rs`). |
+| `inject.rs` | `InjectBus` — the Riichi City gate the bridge writes to: in-game flag, decision window, turn budget, injected-frame relay, server ack counter. |
+| `session.rs` | Full-auto session state: target/completed games, generation counter for the between-games queue task, inter-game delay. |
 | `tenhou_state.rs` | `TenhouState` — the hand at Tenhou tile-index resolution plus the current decision window (the server's `t` bitmask). Written by the Tenhou bridge, read here. Without it an mjai tile *string* cannot be resolved to the physical copy Tenhou wants. |
 | `budget.rs` | `TimeBudget` — the server's per-decision-window time grant (`OptionalOperationList.time_fixed/time_add`, ms). Written by the Majsoul bridge, read here. Never locally accounted; always the server's own value. |
 | `delay/` | The pre-click "thinking time" model. See below. |
-| `context.rs` | `AutoplayContext` — shared slots between the capture backend, the bridge and the manager (`page`, `canvas_rect`, `time_budget`, `input_watch`, `tenhou_state`). |
+| `context.rs` | `AutoplayContext` — shared slots between the capture backend, the bridge and the manager (`page`, `canvas_rect`, `time_budget`, `input_watch`, `tenhou_state`, `inject`, `session`). |
 | `cdp_input.rs` | chromiumoxide wrappers: hover → press → hold → release click sequence (optionally with a mid-press cursor jiggle for retries), canvas rect query, and the Tenhou route's DOM helpers — action-button selectors, the readiness probe, and the call into the injected discard handler. |
-| `verify.rs` | Majsoul only. `InputWatch` — counts the client's own uplink input commands (`inputOperation` / `inputChiPengGang`, bumped by the Majsoul bridge). The manager takes a ticket before pressing; if the count never moves, the click was swallowed and the plan is pressed again (bounded by `click_retries`, gated on the decision window still being live). Repeated dead decisions trigger a page reload (`reload_after_failures`), which reconnects into the hand via the bridge's `GameRestore` path. |
+| `verify.rs` | Majsoul only. `InputWatch` — counts the client's own uplink input commands (`inputOperation` / `inputChiPengGang`, bumped by the Majsoul bridge). The manager takes a ticket before pressing; if the count never moves, the click was swallowed and the plan is pressed again (bounded by `click_retries`, gated on the decision window still being live). |
 
 ## What arrives on the `BotResponseBus`
 
@@ -141,7 +147,7 @@ exactly the declare → echo → discard shape mjai prescribes — then fills
 `Reach.pai`. The built-in native bot does this internally already; the
 manager generalises it to any runner. The follow-up is gated on autoplay
 because it mutates a stateful bot as though riichi were declared, which is
-only safe when we then commit that declaration; in analysis mode the human
+only safe when we then commit that declaration; with autoplay off the human
 may decline. The bridge's later own-seat `reach` echo is dropped from the
 runner's view (`drop_next_own_reach`) so a stateful bot never applies
 `reach` twice. See issue #257.

@@ -1,7 +1,7 @@
 //! Shared state between the Riichi City bridge, the autoplay manager, and
 //! the proxy's client→server relay: injected frames travel through the
-//! broadcast channel; the rest is observation state (windows, settlements)
-//! the bridge writes and autoplay reads.
+//! broadcast channel; the rest is observation state (windows, settlements,
+//! queue pushes) the bridge writes and autoplay reads.
 //!
 //! Broadcast rather than mpsc because every client→server flow subscribes
 //! and only the gameplay flow should carry gameplay frames — the
@@ -14,6 +14,16 @@ use tokio::sync::broadcast;
 
 pub type SharedInjectBus = Arc<InjectBus>;
 
+/// Lobby credentials from the client's WS auth frame; `sid` authenticates
+/// the lobby HTTP API (`bridge::riichi_city::lobby`).
+#[derive(Debug, Clone)]
+pub struct LobbyCredentials {
+    pub sid: String,
+    pub lang: String,
+    pub platform: String,
+    pub version: String,
+}
+
 /// One frame to transmit. `gameplay` frames are gated on `in_game`.
 #[derive(Debug, Clone)]
 pub struct InjectFrame {
@@ -24,6 +34,12 @@ pub struct InjectFrame {
 pub struct InjectBus {
     tx: broadcast::Sender<InjectFrame>,
     in_game: Arc<AtomicBool>,
+    /// `None` until the client authenticates through the proxied WS.
+    lobby_credentials: std::sync::Mutex<Option<LobbyCredentials>>,
+    /// Live queues by classifyID → matchID from `cmd_stagematch_run`
+    /// pushes; queues can overlap (the galaxy→sun fallback is additive)
+    /// and each leaves by its own matchID.
+    queue_state: std::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Count of `rsp_game_action` responses and the latest code (0 = ok).
     /// The count moving after a send proves the server processed the
     /// frame — the injection counterpart of the Majsoul input watch.
@@ -37,6 +53,9 @@ pub struct InjectBus {
     /// against window-open times drift once plans queue up.
     window_open: AtomicBool,
     window_opened_at: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Remaining turn budget of the latest own-turn offer (`oper_fixed +
+    /// oper_var` seconds → ms). 0 = none noted yet.
+    turn_budget_ms: AtomicU32,
     /// (han, yaku count) of the last settlement; (0, 0) on a draw. The
     /// round-advance reading beat scales with it — bigger hands render
     /// longer.
@@ -59,13 +78,69 @@ impl InjectBus {
         Self {
             tx,
             in_game: Arc::new(AtomicBool::new(false)),
+            lobby_credentials: std::sync::Mutex::new(None),
+            queue_state: std::sync::Mutex::new(std::collections::HashMap::new()),
             rsp_seen: AtomicU64::new(0),
             last_rsp_code: AtomicI64::new(0),
             up_index: AtomicU32::new(0),
             window_open: AtomicBool::new(false),
             window_opened_at: std::sync::Mutex::new(None),
+            turn_budget_ms: AtomicU32::new(0),
             settlement: std::sync::Mutex::new((0, 0)),
         }
+    }
+
+    /// Called by the bridge when the server deals us a live draw.
+    /// `budget_ms` is the turn's remaining server time budget — the
+    /// offer's `oper_fixed_time` plus `oper_var_time`. Plans must land
+    /// inside it.
+    pub fn note_own_draw(&self, budget_ms: u32) {
+        self.turn_budget_ms.store(budget_ms, Ordering::Relaxed);
+    }
+
+    /// Remaining turn budget of the latest own-turn offer, in ms. `None`
+    /// before the first offer of a connection.
+    pub fn turn_budget_ms(&self) -> Option<u32> {
+        let v = self.turn_budget_ms.load(Ordering::Relaxed);
+        (v != 0).then_some(v)
+    }
+
+    pub fn note_lobby_credentials(&self, creds: LobbyCredentials) {
+        *self
+            .lobby_credentials
+            .lock()
+            .expect("lobby_credentials poisoned") = Some(creds);
+    }
+
+    pub fn lobby_credentials(&self) -> Option<LobbyCredentials> {
+        self.lobby_credentials
+            .lock()
+            .expect("lobby_credentials poisoned")
+            .clone()
+    }
+
+    pub fn note_queue_state(&self, classify_id: String, match_id: String) {
+        self.queue_state
+            .lock()
+            .expect("queue_state poisoned")
+            .insert(classify_id, match_id);
+    }
+
+    pub fn queue_states(&self) -> Vec<(String, String)> {
+        self.queue_state
+            .lock()
+            .expect("queue_state poisoned")
+            .iter()
+            .map(|(c, m)| (c.clone(), m.clone()))
+            .collect()
+    }
+
+    /// Forget the queue pushes so stale matchIDs are not cancelled twice.
+    pub fn clear_queue_state(&self) {
+        self.queue_state
+            .lock()
+            .expect("queue_state poisoned")
+            .clear();
     }
 
     pub fn note_rsp(&self, code: i64) {
@@ -185,6 +260,16 @@ mod tests {
         assert!(!bus.in_game());
         bus.set_in_game(true);
         assert!(bus.in_game());
+    }
+
+    #[test]
+    fn turn_budget_rides_the_own_draw_note() {
+        let bus = InjectBus::new();
+        assert_eq!(bus.turn_budget_ms(), None, "nothing before the first offer");
+        bus.note_own_draw(25_000);
+        assert_eq!(bus.turn_budget_ms(), Some(25_000));
+        bus.note_own_draw(5_000);
+        assert_eq!(bus.turn_budget_ms(), Some(5_000));
     }
 
     #[test]

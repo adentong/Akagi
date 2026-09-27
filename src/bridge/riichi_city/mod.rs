@@ -4,14 +4,16 @@
 //! over WebSocket. Gameplay messages carry a string `"cmd"` discriminator
 //! inside the JSON (`cmd_enter_room`, `cmd_game_start`, `cmd_game_action_brc`,
 //! …); the binary `cmd` field only matters for `CMDAuth`, which carries our
-//! `uid`. See [`packet`] for the framing and [`consts`] for the tile table.
+//! `uid` and the lobby `sid`. See [`packet`] for the framing and [`consts`]
+//! for the tile table.
 //!
 //! Rust port of the observation half of the Akagi v2 Python Riichi City
 //! bridge, extended with the uplink half autoplay needs: [`build`](Bridge::build)
-//! encodes our actions as client frames injected onto the gameplay socket.
-//! Both wire directions are parsed (the `CMDAuth` packet is client→server
-//! while gameplay broadcasts are server→client; client request frames don't
-//! match any server `cmd_*` and fall through).
+//! encodes our actions as client frames, and `parse` lifts the auth `sid`
+//! and every queue push onto the inject bus for the lobby HTTP client
+//! ([`lobby`]). Both wire directions are parsed (the `CMDAuth` packet is
+//! client→server while gameplay broadcasts are server→client; client
+//! request frames don't match any server `cmd_*` and fall through).
 //!
 //! Two intentional improvements over v2:
 //! - **Sanma** events use the native length 3 (no ghost-padding to 4); actor
@@ -30,6 +32,7 @@
 
 pub mod build;
 pub mod consts;
+pub mod lobby;
 pub mod packet;
 pub mod state;
 
@@ -37,7 +40,7 @@ use super::{Bridge, Direction, ParseResult};
 use crate::{
     config::Platform,
     logger::{FlowLogger, Session},
-    schema::{GameMeta, MatchInfo, MjaiEvent, ParsedFrame},
+    schema::{MjaiEvent, ParsedFrame},
 };
 use chrono::Local;
 use consts::card_to_mjai;
@@ -54,8 +57,6 @@ pub struct RiichiCityBridge {
     /// Our own player id, captured from the `CMDAuth` handshake. `-1` until seen.
     uid: i64,
     status: GameStatus,
-    #[allow(dead_code)]
-    flow_log: Option<Arc<FlowLogger>>,
     session: Option<Arc<Session>>,
     mjai_log: Option<Arc<FlowLogger>>,
     /// Frame-injection gate (see `autoplay::inject`): set while this
@@ -65,11 +66,10 @@ pub struct RiichiCityBridge {
 }
 
 impl RiichiCityBridge {
-    pub fn new(flow_log: Option<Arc<FlowLogger>>, session: Option<Arc<Session>>) -> Self {
+    pub fn new(session: Option<Arc<Session>>) -> Self {
         Self {
             uid: -1,
             status: GameStatus::default(),
-            flow_log,
             session,
             mjai_log: None,
             inject: None,
@@ -113,11 +113,30 @@ impl RiichiCityBridge {
     }
 
     fn dispatch(&mut self, pkt: &WPacket) -> Vec<MjaiEvent> {
-        // The binary auth handshake (client → server) carries our uid.
+        // The binary auth handshake (client → server) carries our uid and
+        // the `sid` the lobby HTTP API authenticates with.
         if pkt.cmd == CMD_AUTH {
             if let Some(uid) = pkt.body.get("uid").and_then(json_i64) {
                 self.uid = uid;
                 info!(target: LOG, "captured player uid from auth");
+            }
+            if let Some(inject) = &self.inject {
+                if let Some(sid) = pkt.body.get("sid").and_then(JsonValue::as_str) {
+                    let field = |k: &str| {
+                        pkt.body
+                            .get(k)
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    inject.note_lobby_credentials(crate::autoplay::inject::LobbyCredentials {
+                        sid: sid.to_string(),
+                        lang: field("lang"),
+                        platform: field("platform"),
+                        version: field("version"),
+                    });
+                    info!(target: LOG, "captured lobby sid from auth");
+                }
             }
             return Vec::new();
         }
@@ -129,9 +148,25 @@ impl RiichiCityBridge {
         // closed by anything that resolves play.
         if let Some(inject) = &self.inject {
             match cmd {
-                "cmd_send_current_action" | "cmd_send_other_action" => inject.note_window(),
-                "cmd_game_action_brc" | "cmd_game_end" | "cmd_room_end" | "cmd_game_start" => {
-                    inject.note_window_closed()
+                "cmd_send_current_action" => inject.note_window(),
+                "cmd_send_other_action" => inject.note_window(),
+                "cmd_game_action_brc" => inject.note_window_closed(),
+                "cmd_game_end" | "cmd_room_end" | "cmd_game_start" => inject.note_window_closed(),
+                // Queue push: the matchID is what cancelStage needs.
+                "cmd_stagematch_run" => {
+                    let classify = data
+                        .and_then(|d| d.get("classifyID"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let match_id = data
+                        .and_then(|d| d.get("matchID"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if !classify.is_empty() && !match_id.is_empty() {
+                        inject.note_queue_state(classify, match_id);
+                    }
                 }
                 _ => {}
             }
@@ -220,6 +255,11 @@ impl RiichiCityBridge {
         self.status = status;
         if let Some(inject) = &self.inject {
             inject.set_in_game(true);
+            // The dead connection's open window is void — its timer was
+            // burning against a socket nobody read. Clear it so plans
+            // can't fire into a stale identity; the server re-offers the
+            // window (if the turn survives) right after this frame.
+            inject.note_window_closed();
         }
         Vec::new()
     }
@@ -251,6 +291,7 @@ impl RiichiCityBridge {
                 }) as u8;
             self.status.seat = seat;
             self.status.shift = dealer_pos;
+            let seat = self.status.seat;
             self.rotate_mjai_log();
             // Display names in mjai-actor order (player_list is already
             // dealer-rotated). A missing nickname becomes "" so the frontend
@@ -268,16 +309,6 @@ impl RiichiCityBridge {
                 aka_flag: None,
                 id: Some(seat),
                 num_players: self.status.num_players,
-                game_meta: Some(GameMeta {
-                    game_id: None,
-                    match_mode: None,
-                    match_info: Some(MatchInfo::RiichiCity {
-                        room_id: self.status.room_id.clone(),
-                        classify_id: self.status.classify_id.clone(),
-                        stage_type: self.status.stage_type,
-                        game_play: self.status.game_play,
-                    }),
-                }),
             });
             self.status.game_start = false;
         }
@@ -394,6 +425,13 @@ impl RiichiCityBridge {
         let pai = field_card(data, "in_card");
         if pai != "?" {
             self.status.drawn_by = Some(self.status.seat);
+            if let Some(inject) = &self.inject {
+                // The offer carries the turn's remaining server budget, so
+                // autoplay plans inside it.
+                let fixed = field_i64(data, "oper_fixed_time").unwrap_or(5).max(0) as u32;
+                let var = field_i64(data, "oper_var_time").unwrap_or(20).max(0) as u32;
+                inject.note_own_draw((fixed + var) * 1000);
+            }
             events.push(MjaiEvent::Tsumo {
                 actor: self.status.seat,
                 pai,
@@ -822,12 +860,94 @@ mod tests {
         feed(b, CMD_AUTH, json!({ "uid": ME.to_string() }));
     }
 
+    /// The auth frame's sid (plus the client meta) must be lifted onto the
+    /// inject bus — it is what the lobby HTTP API authenticates with.
+    #[test]
+    fn auth_frame_lifts_lobby_credentials() {
+        let inject = std::sync::Arc::new(crate::autoplay::inject::InjectBus::new());
+        let mut bridge = RiichiCityBridge::new(None).with_inject(Some(inject.clone()));
+
+        assert!(inject.lobby_credentials().is_none(), "nothing before auth");
+        feed(
+            &mut bridge,
+            CMD_AUTH,
+            json!({
+                "uid": ME.to_string(),
+                "sid": "da3p6g8h8t2s5j53ggs03740f8",
+                "lang": "en",
+                "platform": "pc",
+                "version": "2.2.4.95474",
+            }),
+        );
+        let creds = inject
+            .lobby_credentials()
+            .expect("sid captured from the auth frame");
+        assert_eq!(creds.sid, "da3p6g8h8t2s5j53ggs03740f8");
+        assert_eq!(creds.lang, "en");
+        assert_eq!(creds.platform, "pc");
+        assert_eq!(creds.version, "2.2.4.95474");
+    }
+
+    /// Every `cmd_stagematch_run` push must land on the inject bus — the
+    /// matchIDs are what `cancelStage` needs to leave the queues, and the
+    /// galaxy + sun fallback runs two at once.
+    #[test]
+    fn stagematch_run_lands_on_the_inject_bus() {
+        let inject = std::sync::Arc::new(crate::autoplay::inject::InjectBus::new());
+        let mut bridge = RiichiCityBridge::new(None).with_inject(Some(inject.clone()));
+
+        assert!(inject.queue_states().is_empty());
+        feed(
+            &mut bridge,
+            0,
+            json!({
+                "cmd": "cmd_stagematch_run",
+                "data": {
+                    "classifyID": "bvgn113gm5c5il7c48rg7",
+                    "matchID": "da26fvro1kn6d935usfg",
+                    "round": 1,
+                    "stageType": 4,
+                },
+            }),
+        );
+        // A second, concurrent queue (the sun fallback) is tracked
+        // alongside, not instead of, the first.
+        feed(
+            &mut bridge,
+            0,
+            json!({
+                "cmd": "cmd_stagematch_run",
+                "data": {
+                    "classifyID": "bvgn113gm5c5il7c48rg5",
+                    "matchID": "da77sunqueue000000000",
+                    "round": 1,
+                    "stageType": 3,
+                },
+            }),
+        );
+        let mut queues = inject.queue_states();
+        queues.sort();
+        assert_eq!(
+            queues,
+            vec![
+                (
+                    "bvgn113gm5c5il7c48rg5".to_string(),
+                    "da77sunqueue000000000".to_string()
+                ),
+                (
+                    "bvgn113gm5c5il7c48rg7".to_string(),
+                    "da26fvro1kn6d935usfg".to_string()
+                ),
+            ]
+        );
+    }
+
     /// Every rsp_game_action must bump the ack counter autoplay verifies
     /// its injected frames against.
     #[test]
     fn rsp_game_action_bumps_the_ack_counter() {
         let inject = std::sync::Arc::new(crate::autoplay::inject::InjectBus::new());
-        let mut bridge = RiichiCityBridge::new(None, None).with_inject(Some(inject.clone()));
+        let mut bridge = RiichiCityBridge::new(None).with_inject(Some(inject.clone()));
         let ticket = inject.rsp_ticket();
         feed(
             &mut bridge,
@@ -877,7 +997,7 @@ mod tests {
     /// (fresh `start_game`) even without an intervening `cmd_room_end`.
     #[test]
     fn same_queue_new_table_is_not_deduped() {
-        let mut b = RiichiCityBridge::new(None, None);
+        let mut b = RiichiCityBridge::new(None);
         auth(&mut b);
         enter_room_4p(&mut b);
         let start = json!({
@@ -921,24 +1041,14 @@ mod tests {
             }),
         );
         let events = feed(&mut b, 18, start);
-        match &events[0] {
-            MjaiEvent::StartGame { game_meta, .. } => {
-                match &game_meta.as_ref().expect("meta").match_info {
-                    Some(MatchInfo::RiichiCity { room_id, .. }) => {
-                        assert_eq!(room_id.as_deref(), Some("tabletoken0002"));
-                    }
-                    other => panic!("expected RiichiCity match_info, got {other:?}"),
-                }
-            }
-            other => panic!("expected StartGame for the second game, got {other:?}"),
-        }
+        assert!(matches!(events[0], MjaiEvent::StartGame { .. }));
     }
 
     /// A re-announcement of the *same* table (reconnect) is ignored, so a
     /// partial payload can't clobber the collected roster.
     #[test]
     fn duplicate_same_table_enter_room_keeps_the_roster() {
-        let mut b = RiichiCityBridge::new(None, None);
+        let mut b = RiichiCityBridge::new(None);
         auth(&mut b);
         enter_room_4p(&mut b);
         feed(
@@ -962,7 +1072,7 @@ mod tests {
 
     #[test]
     fn yonma_game_start_emits_start_game_kyoku_tsumo() {
-        let mut b = RiichiCityBridge::new(None, None);
+        let mut b = RiichiCityBridge::new(None);
         auth(&mut b);
         enter_room_4p(&mut b);
         // dealer_pos 0 → no rotation; ME is index 0 → seat 0 → we are dealer
@@ -994,7 +1104,6 @@ mod tests {
                 id,
                 num_players,
                 names,
-                game_meta,
                 ..
             } => {
                 assert_eq!(*id, Some(0));
@@ -1010,20 +1119,6 @@ mod tests {
                         "dave".to_string(),
                     ]
                 );
-                match &game_meta.as_ref().expect("riichi city meta").match_info {
-                    Some(MatchInfo::RiichiCity {
-                        room_id,
-                        classify_id,
-                        stage_type,
-                        game_play,
-                    }) => {
-                        assert_eq!(room_id.as_deref(), Some("tabletoken0001"));
-                        assert_eq!(classify_id.as_deref(), Some("classifytoken0001"));
-                        assert_eq!(*stage_type, Some(1));
-                        assert_eq!(*game_play, Some(1001));
-                    }
-                    other => panic!("expected RiichiCity match_info, got {other:?}"),
-                }
             }
             other => panic!("expected StartGame, got {other:?}"),
         }
@@ -1064,7 +1159,7 @@ mod tests {
     /// while MJAI actors are rotated so actor 0 is the first dealer.
     #[test]
     fn game_start_maps_scores_to_rotated_actor_order() {
-        let mut b = RiichiCityBridge::new(None, None);
+        let mut b = RiichiCityBridge::new(None);
         auth(&mut b);
         enter_room_4p(&mut b);
 
@@ -1115,7 +1210,7 @@ mod tests {
 
     #[test]
     fn sanma_uses_native_length_three() {
-        let mut b = RiichiCityBridge::new(None, None);
+        let mut b = RiichiCityBridge::new(None);
         feed(&mut b, CMD_AUTH, json!({ "uid": "1002" }));
         feed(
             &mut b,
@@ -1176,7 +1271,7 @@ mod tests {
     }
 
     fn started_4p() -> RiichiCityBridge {
-        let mut b = RiichiCityBridge::new(None, None);
+        let mut b = RiichiCityBridge::new(None);
         auth(&mut b);
         enter_room_4p(&mut b);
         feed(

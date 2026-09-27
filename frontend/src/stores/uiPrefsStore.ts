@@ -5,17 +5,6 @@ import { create } from 'zustand'
 // in `useSidebar` (own zustand+persist store ported from shadcn-ui-sidebar).
 const SCALE_KEY = 'akagi.ui.scale'
 
-// One-time flag: has the user seen the dashboard onboarding hint (drag /
-// resize / remove / add tiles)? Deliberately NOT reset by "Reset Layout" —
-// this tracks "has seen the tutorial", not layout state.
-const ONBOARDED_KEY = 'akagi.dashboard.onboarded'
-
-// The AkagiMS Overview promo card's dismissed flag. (The old standalone
-// AkagiMS announcement dialog was folded into the unified announcements
-// system — see announcementStore — so only the card state remains here;
-// its former `akagi.announcement.akagims{,.shows}` keys are abandoned.)
-const AKAGIMS_CARD_KEY = 'akagi.announcement.akagims.card'
-
 export const SCALE_MIN = 0.7
 export const SCALE_MAX = 1.5
 export const SCALE_STEP = 0.05
@@ -37,33 +26,10 @@ function loadScale(): number {
   }
 }
 
-function loadFlag(key: string): boolean {
-  if (typeof localStorage === 'undefined') return false
-  try {
-    return localStorage.getItem(key) === '1'
-  } catch {
-    return false
-  }
-}
-
-function storeFlag(key: string) {
-  try {
-    localStorage.setItem(key, '1')
-  } catch {
-    /* quota — ignore */
-  }
-}
-
 type UiPrefsStore = {
   scale: number
   setScale: (v: number) => void
   resetScale: () => void
-  /** Whether the dashboard onboarding hint has been dismissed at least once. */
-  dashboardOnboarded: boolean
-  markDashboardOnboarded: () => void
-  /** Whether the Overview AkagiMS promo card has been dismissed. */
-  akagimsCardDismissed: boolean
-  markAkagimsCardDismissed: () => void
 }
 
 export const useUiPrefsStore = create<UiPrefsStore>((set) => ({
@@ -84,19 +50,5 @@ export const useUiPrefsStore = create<UiPrefsStore>((set) => ({
       /* quota — ignore */
     }
     set({ scale: SCALE_DEFAULT })
-  },
-  dashboardOnboarded: loadFlag(ONBOARDED_KEY),
-  markDashboardOnboarded: () => {
-    try {
-      localStorage.setItem(ONBOARDED_KEY, '1')
-    } catch {
-      /* quota — ignore */
-    }
-    set({ dashboardOnboarded: true })
-  },
-  akagimsCardDismissed: loadFlag(AKAGIMS_CARD_KEY),
-  markAkagimsCardDismissed: () => {
-    storeFlag(AKAGIMS_CARD_KEY)
-    set({ akagimsCardDismissed: true })
   },
 }))

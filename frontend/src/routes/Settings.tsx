@@ -26,7 +26,6 @@ import {
 import { HAS_TAURI, invoke } from '@/lib/tauri'
 import { openExternal } from '@/lib/external'
 import { useSidebar } from '@/hooks/useSidebar'
-import { useAnnouncementStore } from '@/stores/announcementStore'
 import { useCaptureStore } from '@/stores/captureStore'
 import { useConfigStore } from '@/stores/configStore'
 import { selectHasNotifiableUpdate, useUpdaterStore } from '@/stores/updaterStore'
@@ -59,6 +58,7 @@ import {
 } from '@/types'
 import type {
   AppConfig,
+  AutoplayConfig,
   CaptureMode,
   DelayMode,
   DelayModelConfig,
@@ -841,10 +841,10 @@ function AutoplayCard({
       click_hold_ms: 50,
       verify_input_ms: 300,
       click_retries: 2,
-      reload_after_failures: 3,
       dealer_first_discard_extra_delay_ms: 2000,
     },
     delay: defaultDelayModel(),
+    riichi_city: defaultRiichiCityAutoplay(),
   }
   const delay = ap.delay ?? defaultDelayModel()
   const captureIsChromium = draft.capture?.mode === 'chromium'
@@ -1049,22 +1049,6 @@ function AutoplayCard({
           />
         </Field>
         <Field
-          label={t('settings.autoplay.reload_after_failures')}
-          hint={t('settings.autoplay.reload_after_failures_hint')}
-        >
-          <Input
-            type="number"
-            inputMode="numeric"
-            min={0}
-            value={ap.majsoul.reload_after_failures}
-            onChange={(e) =>
-              setMajsoulField({
-                reload_after_failures: Number(e.target.value || 0),
-              })
-            }
-          />
-        </Field>
-        <Field
           label={t('settings.autoplay.dealer_first_discard_extra_delay')}
           hint={t('settings.autoplay.dealer_first_discard_extra_delay_hint')}
         >
@@ -1086,6 +1070,16 @@ function AutoplayCard({
       </CardContent>
     </Card>
   )
+}
+
+/** Mirror of `RiichiCityAutoplayConfig::default()` on the Rust side. */
+function defaultRiichiCityAutoplay(): AutoplayConfig['riichi_city'] {
+  return {
+    room: 'galaxy',
+    game_type: 'east_only',
+    galaxy_fallback_sun: false,
+    inter_game_delay_ms: 8000,
+  }
 }
 
 /** Mirror of `DelayModelConfig::default()` on the Rust side. */
@@ -1508,13 +1502,6 @@ function UpdatesCard() {
         <div className="flex items-center justify-between gap-2">
           <span className="text-xs text-muted-foreground">{lastCheckedLabel}</span>
           <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => useAnnouncementStore.getState().openHistory()}
-            >
-              {t('announcements.dialog.settings_button')}
-            </Button>
             <Button
               size="sm"
               variant="outline"

@@ -50,7 +50,7 @@ fn tenhou_rejoin_without_taikyoku_keeps_our_seat_and_hand_intact() {
     let mut tracker = GameTracker::new();
 
     // ---- Flow 1: the game starts normally. We sit West (wire-abs 2). ----
-    let mut flow1 = TenhouBridge::new(None, None);
+    let mut flow1 = TenhouBridge::new(None);
     feed(
         &mut flow1,
         &mut tracker,
@@ -87,7 +87,7 @@ fn tenhou_rejoin_without_taikyoku_keeps_our_seat_and_hand_intact() {
     drop(flow1);
 
     // ---- Flow 2: the client rejoins. No TAIKYOKU, a REINIT snapshot. ----
-    let mut flow2 = TenhouBridge::new(None, None);
+    let mut flow2 = TenhouBridge::new(None);
     let reinit = format!(
         r#"{{"tag":"REINIT","seed":"0,0,0,1,2,4","ten":"250,250,250,250","oya":"2","hai":"{HAND_E1}","kawa0":"20","kawa1":"33","kawa2":"5","kawa3":"9"}}"#
     );

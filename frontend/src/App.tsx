@@ -6,7 +6,6 @@ import { Statusbar } from '@/components/Statusbar'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { Toaster } from '@/components/ui/sonner'
 import { UpdateNotifier } from '@/components/UpdateNotifier'
-import { AnnouncementsDialog } from '@/components/AnnouncementsDialog'
 import { InstallBlockingOverlay } from '@/components/InstallBlockingOverlay'
 import { useTauriBridge } from '@/hooks/useTauriBridge'
 import { useSidebar } from '@/hooks/useSidebar'
@@ -38,8 +37,8 @@ export default function App() {
           'h-screen flex flex-col min-w-0 overflow-hidden bg-background text-foreground transition-[margin-left] ease-in-out duration-300',
           // Margin tracks the *pinned* width only — hover-open expands the
           // sidebar over main content (z-20) without shifting layout, so
-          // width-sensitive widgets like the GameDashboard's react-grid-layout
-          // don't re-flow every time the cursor brushes the sidebar.
+          // width-sensitive widgets don't re-flow every time the cursor
+          // brushes the sidebar.
           settings.disabled
             ? 'lg:ml-0'
             : isOpen
@@ -60,7 +59,6 @@ export default function App() {
       </main>
       <Toaster />
       <UpdateNotifier />
-      <AnnouncementsDialog />
       <InstallBlockingOverlay />
     </>
   )

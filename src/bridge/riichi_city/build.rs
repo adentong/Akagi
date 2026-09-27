@@ -13,7 +13,8 @@
 //! tile *rack*: the sorted concealed hand with a freshly drawn tile
 //! appended LAST. The engine's tehai merges the drawn tile in sort order
 //! instead, so [`Rack`] reconstructs the client's view before any
-//! position is computed.
+//! position is computed. Matchmaking does not ride this WebSocket at all
+//! (see `super::lobby`).
 
 use crate::schema::MjaiEvent;
 use serde_json::{json, Value};

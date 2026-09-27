@@ -2,7 +2,7 @@
 
 The `<mah-gen>` web component has a frustrating sizing model. We learned this
 the hard way; everything below is required reading before touching tile size
-code in `js/app.js`.
+code in `src/lib/mahgenRegistry.ts`.
 
 ### What `mah-gen` actually does
 
@@ -66,44 +66,12 @@ Stacked (called):        92 × 146   (e.g. =1m.png — used for ankan back tile)
 Space:                  ~70 × ...   (used as filler in melds)
 ```
 
-### River-mode layout
-
-The upstream mahgen `JimpWorker.ts` lays at most 6 tiles per row in river
-mode, then wraps to a new row. So a river image's natural dimensions:
-
-```
-N tiles, N <= 6:     naturalW = N × 70,    naturalH = 100
-N tiles, 7..12:      naturalW = 420,       naturalH = 200
-N tiles, 13..18:     naturalW = 420,       naturalH = 300
-...
-```
-
-This matters because aspect-fit-to-cw (`h = cw × naturalH / naturalW`) gives
-**different per-tile sizes** depending on row count: 6 tiles in 1 row would
-fill width with tile_h ≈ cw/6 × 1.43, but 7 tiles in 2 rows would compute
-tile_h ≈ cw/12 × 1.43 (half the size). Tiles visibly shrink the moment a
-second row appears. Bad.
-
-The fix: **scale uniformly** so 6 tiles always span container width, and rows
-just stack vertically:
-
-```js
-const RIVER_FULL_ROW_W = 420;    // 6 × 70
-const scale = cw / RIVER_FULL_ROW_W;
-const w = naturalW * scale;
-const h = naturalH * scale;
-```
-
-Per-tile size stays constant regardless of row count.
-
-### Sizing modes (current `SIZE_CTX` in `js/app.js`)
+### Sizing modes (current `SIZE_CTX` in `mahgenRegistry.ts`)
 
 | Mode | Formula | When to use |
 |---|---|---|
-| `river` | `scale = cw / 420`; `w = nw * scale`; `h = nh * scale` | River — single mahgen, multi-row, must keep per-tile size constant |
-| `fit` | `w = cw; h = cw * nh / nw` (clamped to `[min, max]`) | Self hand — single mahgen, single row, fill container width |
-| `linear` | `h = base * cw / ref` (clamped); `w = h * nw / nh` | Multiple mahgens in same row (melds), or rec/dora where container is much wider than image |
-| `fixed` | `h = base`; `w = h * nw / nh` | Top-bar dora pill — container is content-sized so any container-based formula self-feeds |
+| `linear` | `h = base * cw / ref` (clamped); `w = h * nw / nh` | Rows in the bot-show list: multiple mahgens in the same row, container much wider than the image |
+| `fill-height` | `h = clamp(ch - pad, [min, max])`; `w = h * nw / nh` | The overlay's rows, where the container's *height* is the scarce axis and the tile grows with the window |
 
 ### Async timing
 
@@ -113,11 +81,11 @@ Three things are async:
    when the mahgen UMD script executes. If you create `<mah-gen>` before that
    completes, `el.shadowRoot` is `null`. → RAF retry until ready.
 
-2. **DOM connect.** `registerMahgen` is called inside `buildPanel` *before*
-   the panel is appended to the DOM, so `el.isConnected` is `false` on the
-   first sizing pass. → Retry with a counter (we use up to 6 RAF), then drop
-   the entry. Don't delete on first detach — that was the bug that kept
-   river tiles at native size for several iterations.
+2. **DOM connect.** `registerMahgen` may be called before the element is
+   appended to the DOM, so `el.isConnected` is `false` on the first sizing
+   pass. → Retry with a counter (we use up to 6 RAF), then drop the entry.
+   Don't delete on first detach — that was the bug that kept tiles at native
+   size for several iterations.
 
 3. **Image load.** `img.src = base64` triggers an async decode. `naturalWidth`
    / `naturalHeight` read 0 until the `load` event fires. → Attach a single
@@ -134,12 +102,8 @@ if (!img._akagiOnLoad) {
 ### Container resize
 
 A `ResizeObserver` watches the size container of every registered mahgen so
-that:
-- Window resize cascades to all tiles
-- The rail-drag handle (which changes the players column width) reflows river
-  and meld tiles automatically
-- The bottom-bar collapse doesn't matter (cards are flex children) but rail
-  width changes do
+that a window resize (or any container size change) reflows the tiles
+automatically.
 
 Each container is observed once (RO calls are idempotent). The callback finds
 all registry entries whose `container` matches the resized element and
@@ -165,20 +129,20 @@ el.style.display = '';   // restore CSS rule's `display: inline-block`
 
 The retry counter handles "element will be attached momentarily" but it does
 **not** handle "element was deliberately removed via `innerHTML = ''`". For
-those code paths (rec list rebuild on every `analysis-result`), call
-`unregisterMahgen(m)` for each `<mah-gen>` before the wipe:
+those code paths, call `unregisterMahgen(m)` for each `<mah-gen>` before the
+wipe:
 
 ```js
-recList.querySelectorAll('mah-gen').forEach((m) => unregisterMahgen(m));
-recList.innerHTML = '';
+list.querySelectorAll('mah-gen').forEach((m) => unregisterMahgen(m));
+list.innerHTML = '';
 ```
 
-Otherwise the registry leaks an entry per old recommendation tile every time
-the analysis updates.
+Otherwise the registry leaks an entry per old row every time the list
+rebuilds.
 
 ### Quick checklist for adding a new mahgen-bearing widget
 
-1. Pick a sizing mode (`river` / `fit` / `linear` / `fixed`) and add an entry
+1. Pick a sizing mode (`linear` / `fill-height`) and add an entry
    to `SIZE_CTX` if needed.
 2. Pick a sizing **container** — an ancestor whose `clientWidth` is what
    bounds the tiles. Don't pick a content-sized element (its width depends on

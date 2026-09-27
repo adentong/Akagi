@@ -6,9 +6,9 @@ The hudsucker dependency in `Cargo.toml` opts out of default features and re-ena
 
 ## Files
 
-- `mod.rs` — Public entry: `start_proxy(config, session, shutdown)`. Builds the proxy from `ProxyConfig` and shares the logging `Session`.
+- `mod.rs` — Public entry: `start_proxy(config, http_cfg, platform, session, mjai_tx, notify_tx, force_close, inject, shutdown)`. Builds the proxy from `ProxyConfig`, wires the platform bridge and autoplay's injection gate, and shares the logging `Session`.
 - `ca.rs` — CA certificate management. Loads `akagi-ca.cer` + `akagi-ca.key` from `ca_dir`, generating a fresh self-signed CA on first run. Also writes the cert in `.crt` / `.pem` / `.der` form and the key in `.key.der` form for OS / tooling compatibility.
-- `handler.rs` — `ProxyHandler` implementing `HttpHandler` + `WebSocketHandler`. Logs WS frame direction/length to text log and writes raw binary frames to `<session>/proxy.binlog`. Extend here to parse protocol messages. The HTTP side logs every forwarded request and any upstream-forward failure with full error source chain under tracing target `akagi::proxy::forward` — filter on that target when diagnosing "stuck on loading" reports. `should_intercept` raw-tunnels any CONNECT whose authority is an IP literal so app-side SNI/Host headers reach multi-tenant CDNs intact; hostnames continue to be MITM'd. `handle_request` refuses any CONNECT to a loopback authority with a `403` — see below.
+- `handler.rs` — `ProxyHandler` implementing `HttpHandler` + `WebSocketHandler`. Logs WS frame direction/length to text log and writes raw binary frames to `<session>/proxy.binlog`, then hands the bytes to the platform bridge (`bridge::for_platform`) for protocol parsing. The HTTP side logs every forwarded request and any upstream-forward failure with full error source chain under tracing target `akagi::proxy::forward` — filter on that target when diagnosing "stuck on loading" reports. `should_intercept` raw-tunnels any CONNECT whose authority is an IP literal so app-side SNI/Host headers reach multi-tenant CDNs intact; hostnames continue to be MITM'd. `handle_request` refuses any CONNECT to a loopback authority with a `403` — see below.
 
 ## Loopback CONNECT is refused
 
@@ -50,7 +50,7 @@ block_telemetry = true
 ## HTTP capture
 
 `handle_request` and `handle_response` record every intercepted exchange
-onto the Inspector timeline and forward it unaltered — bodies are
+into `<session>/inspector.jsonl` and forward it unaltered — bodies are
 buffered and the message rebuilt, never rewritten. Recognized exchanges
 (analytics beacons and the like) are annotated by
 `crate::inspector::annotate`; the proxy itself knows nothing about what
@@ -152,7 +152,7 @@ still forwards.
 
 ## Adding traffic interception
 
-Edit `handler.rs::ProxyHandler::handle_message`. The `WebSocketContext` distinguishes upstream (`ClientToServer`) vs downstream (`ServerToClient`) frames. Return `Some(msg)` to forward unchanged, return a modified `Message` to inject changes, or return `None` to drop.
+WebSocket frames are parsed by the platform bridges (`bridge::for_platform`); to change how a frame is interpreted, edit the bridge. To change what the proxy itself does with a frame before forwarding, edit `ProxyHandler::handle_message` — the `WebSocketContext` distinguishes upstream (`ClientToServer`) vs downstream (`ServerToClient`) frames. Return `Some(msg)` to forward unchanged, return a modified `Message` to inject changes, or return `None` to drop.
 
 For protobuf parsing, see `src/bridge/majsoul/parser.rs` — Majsoul WS frames use a 5-layer format: `[type byte][BaseMessage protobuf][inner message][XOR-encrypted action]`.
 

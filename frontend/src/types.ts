@@ -91,9 +91,8 @@ export type DetectedBrowser = {
   path: string
 }
 
-/// Bridge selector (the runtime kind, not the history-record tag — those
-/// share names but the schema enum carries extra archive-only variants).
-/// Mirrors `src/config/platform.rs::Platform` (`#[derive(Serialize)]` →
+/// Bridge selector (the runtime kind). Mirrors
+/// `src/config/platform.rs::Platform` (`#[derive(Serialize)]` →
 /// PascalCase JSON: `"Majsoul"`, `"Tenhou"`).
 export type PlatformKind = 'Majsoul' | 'Tenhou' | 'RiichiCity'
 
@@ -108,8 +107,6 @@ export type MajsoulAutoplayConfig = {
   verify_input_ms: number
   /** Retries when no input command follows a click sequence; 0 = log only. */
   click_retries: number
-  /** Reload the game page after this many dead decisions in a row; 0 = off. */
-  reload_after_failures: number
   dealer_first_discard_extra_delay_ms: number
 }
 
@@ -143,10 +140,33 @@ export type DelayModelConfig = {
   no_budget_cap_ms: number
 }
 
+/** Riichi City ranked rooms, lowest to highest. Mirrors
+ *  `src/config/autoplay.rs::RiichiRoom`. */
+export type RiichiRoom = 'star' | 'moon' | 'sun' | 'galaxy'
+
+/** Riichi City ranked game lengths. Mirrors
+ *  `src/config/autoplay.rs::RiichiGameType`. */
+export type RiichiGameType = 'east_only' | 'hanchan'
+
+/** Riichi City autoplay session knobs. Mirrors
+ *  `src/config/autoplay.rs::RiichiCityAutoplayConfig`. */
+export type RiichiCityAutoplayConfig = {
+  /** Room to queue ranked matches in. */
+  room: RiichiRoom
+  /** Game length to queue. */
+  game_type: RiichiGameType
+  /** Galaxy only: accept a Sun table if none is found within 2 minutes. */
+  galaxy_fallback_sun: boolean
+  /** Wait after a game ends before queueing the next (actual wait is
+   *  uniform in [x, 1.5x]), ms. */
+  inter_game_delay_ms: number
+}
+
 export type AutoplayConfig = {
   enabled: boolean
   majsoul: MajsoulAutoplayConfig
   delay: DelayModelConfig
+  riichi_city: RiichiCityAutoplayConfig
 }
 
 /** Optional cloud-inference settings for the built-in native bot.
@@ -224,10 +244,6 @@ export type KeyStatus = {
   rpd: number
   rpm: number
   topk: number
-  /** Whole-game reviews submitted today (own meter, resets at UTC midnight). */
-  reviews_today: number
-  /** Review jobs the plan allows per day. 0 ⇒ no review access. */
-  reviews_per_day: number
 }
 
 /** One model a key's plan may use (`GET /v3/models`). */
@@ -252,55 +268,6 @@ export type ApiHealth = {
   /** Total pending + in-flight inference rows. */
   queue_depth: number
   workers_alive: boolean
-}
-
-// ---------- Whole-game review (native API) ----------
-// Mirror the response shapes from `crate::bot::api`.
-
-/** `POST /v3/review` — the queued background job. */
-export type ReviewSubmitted = {
-  review_id: string
-  status: string
-}
-
-/** `GET /v3/review/{id}` — job progress. Meta-only: a `done` job carries the
- *  share URL, and the result body is only ever served through that URL. */
-export type ReviewJobStatus = {
-  status: 'queued' | 'running' | 'failed' | 'done' | string
-  progress?: number | null
-  error?: string | null
-  /** Null after a revoke — re-issue via `native_api_review_share`. */
-  share_id?: string | null
-  url?: string | null
-}
-
-/** `POST /v3/review/{id}/share` — the review's public link. */
-export type ShareIssued = {
-  share_id: string
-  url: string
-  created_at: string
-  anonymized: boolean
-}
-
-/** Aggregate result numbers carried by the share listing. */
-export type ShareSummary = {
-  n_decisions: number
-  n_match: number
-  match_rate: number
-  avg_actual_prob: number
-}
-
-/** One live share link from `GET /v3/shares` (newest first). */
-export type ShareEntry = {
-  share_id: string
-  /** The review job this share serves — joins a listing row back to a submit. */
-  review_id: string
-  /** The review's submit time (RFC 3339). */
-  created_at: string
-  anonymized: boolean
-  model?: string | null
-  player_id?: number | null
-  summary?: ShareSummary | null
 }
 
 // ---------- Self-serve key purchase (PayPal) ----------
@@ -403,429 +370,3 @@ export type Snapshot = {
   log_dir: string
 }
 
-export type WaitInfo = { tile: string; left: number; agari_rate: number | null }
-
-export type ImproveEntry = { draw: string; widened_waits: WaitInfo[]; widened_total: number }
-
-export type Hand13Result = {
-  shanten: number
-  waits: WaitInfo[]
-  waits_total: number
-  next_shanten_waits_count: { [tileIdx: number]: number }
-  avg_next_shanten_waits: number
-  mixed_waits_score: number
-  avg_agari_rate: number
-  is_furiten: boolean
-  furiten_rate: number
-  improves: ImproveEntry[]
-  improve_way_count: number
-  avg_improve_waits_count: number
-  dama_point: number
-  riichi_point: number
-  mixed_round_point: number
-  yaku_ids: number[]
-}
-
-export type DiscardCandidate = { discard: string; result: Hand13Result }
-
-export type Hand14Result = {
-  shanten: number
-  maintain: DiscardCandidate[]
-  backwards: DiscardCandidate[]
-}
-
-export type OpponentRisk = {
-  seat: number
-  tenpai_rate: number
-  risk: number[]
-  is_riichi: boolean
-}
-
-export type AnalysisResult = {
-  seat: number
-  turn: number
-  shanten: number
-  state: 'wait13' | 'discard14'
-  hand13: Hand13Result | null
-  hand14: Hand14Result | null
-  opponents: OpponentRisk[]
-  mixed_risk: number[]
-  best_attack_discard: string | null
-  best_defence_discard: string | null
-}
-
-export type DiscardEntry = {
-  tile: string
-  tedashi: boolean
-  is_riichi: boolean
-  /** Claimed by another player (pon/chi/kan); kept for analysis, hidden in the
-   * rendered river. */
-  called?: boolean
-}
-
-export type MeldSnapshot = {
-  kind: 'chi' | 'pon' | 'daiminkan' | 'ankan' | 'kakan'
-  tiles: string[]
-  from_who: number
-  called_tile: string | null
-}
-
-export type PlayerSnapshot = {
-  seat: number
-  tehai: string[]
-  melds: MeldSnapshot[]
-  river: DiscardEntry[]
-  score: number
-  riichi_declared: boolean
-  riichi_stage: boolean
-  double_riichi: boolean
-  riichi_declaration_index: number | null
-  /** 3p only: north tiles set aside via kita / nukidora. Empty in 4p. */
-  kita_tiles: string[]
-}
-
-export type GameStateSnapshot = {
-  bakaze: 'E' | 'S' | 'W' | 'N'
-  kyoku: number
-  honba: number
-  kyotaku: number
-  oya: number
-  current_player: number
-  turn_count: number
-  phase: 'wait_act' | 'wait_response'
-  is_done: boolean
-  /** 3 (sanma) or 4 (yonma). */
-  num_players: number
-  /** Length matches num_players. */
-  players: PlayerSnapshot[]
-  dora_markers: string[]
-  our_seat: number | null
-}
-
-export type PlayerMahgenView = {
-  seat: number
-  hand: string
-  melds: string[]
-  river: string
-}
-
-export type MahgenView = {
-  /** Length matches num_players. */
-  players: PlayerMahgenView[]
-  /** 3 (sanma) or 4 (yonma). */
-  num_players: number
-  dora_indicators: string
-}
-
-/** Mirrors `crate::schema::HoraScoreInfo`. Returned by `compute_bot_hora_score`. */
-export type HoraScoreInfo = {
-  points: number
-  han: number
-  fu: number
-  yakuman: boolean
-  /** mjai tile string of the winning tile. */
-  win_tile: string
-}
-
-// ---------- Game History ----------
-//
-// Mirrors `crate::schema::history::*`. Strings carry RFC3339 timestamps;
-// the frontend parses them with `new Date(...)` on demand.
-
-export type Platform =
-  | 'majsoul'
-  | 'tenhou'
-  | 'riichi_city'
-  | 'mjai'
-  | 'unknown'
-
-export type KyokuMode = 'east_only' | 'east_south' | 'other'
-
-/** Per-game stat counters from the recorded player's perspective. */
-export type GameStats = {
-  round: number
-  oya: number
-
-  fuuro: number
-  fuuro_num: number
-  fuuro_point: number
-  fuuro_agari: number
-  fuuro_agari_jun: number
-  fuuro_agari_point: number
-  fuuro_houjuu: number
-
-  agari: number
-  agari_as_oya: number
-  agari_jun: number
-  agari_point_oya: number
-  agari_point_ko: number
-
-  houjuu: number
-  houjuu_jun: number
-  houjuu_to_oya: number
-  houjuu_point_to_oya: number
-  houjuu_point_to_ko: number
-
-  riichi: number
-  riichi_as_oya: number
-  riichi_jun: number
-  riichi_agari: number
-  riichi_agari_point: number
-  riichi_agari_jun: number
-  riichi_houjuu: number
-  riichi_ryukyoku: number
-  riichi_point: number
-  chasing_riichi: number
-  riichi_got_chased: number
-
-  dama_agari: number
-  dama_agari_jun: number
-  dama_agari_point: number
-
-  ryukyoku: number
-  ryukyoku_point: number
-
-  yakuman: number
-  nagashi_mangan: number
-}
-
-/**
- * Platform-specific match identity captured at `start_game` — which room /
- * rank lobby the game was played in plus the platform's own game (paifu) id.
- * Mirrors `crate::schema::history::MatchInfo`: internally tagged on
- * `platform`, raw platform values, `None` fields omitted from the JSON.
- */
-export type MatchInfo =
-  | {
-      platform: 'majsoul'
-      /** Raw `game_uuid` — the replay identifier. */
-      game_uuid?: string | null
-      /** Ranked matchmode id (1..=28 = Bronze..Throne / Melee, 4p+3p). */
-      mode_id?: number | null
-      /** Friendly/AI room number. */
-      room_id?: number | null
-      /** Tournament id. */
-      contest_uid?: number | null
-    }
-  | {
-      platform: 'tenhou'
-      /** Paifu id from `<TAIKYOKU log=…>`. */
-      log_id?: string | null
-      /** Raw `<GO type=…>` rule/room bitfield (tier in bits 0x20/0x80). */
-      go_type?: number | null
-      /** Lobby number; 0 = the public ranked lobby. */
-      lobby?: number | null
-    }
-  | {
-      platform: 'riichi_city'
-      /** Table-instance token from the `cmd_enter_room` wrapper. */
-      room_id?: string | null
-      /** Matchmaking classification id (wire string). */
-      classify_id?: string | null
-      /** Rank stage tier of the matchmaking room. */
-      stage_type?: number | null
-      /** Game mode id (e.g. 1001). */
-      game_play?: number | null
-    }
-
-export type GameRecord = {
-  id: string
-  /** RFC3339 timestamp. */
-  started_at: string
-  /** RFC3339 timestamp. */
-  ended_at: string
-  platform: Platform
-  num_players: 3 | 4
-  kyoku_mode: KyokuMode
-  names: string[]
-  our_seat: number | null
-  final_scores: number[]
-  final_ranks: number[]
-  our_rank: number | null
-  /** `final_score - starting_score` (4p:25000, 3p:35000). */
-  our_delta: number | null
-  stats: GameStats
-  /** Absent/null on records from before this field existed. */
-  match_info?: MatchInfo | null
-  log_path: string
-}
-
-export type HistoryFilter = {
-  platform?: Platform
-  num_players?: 3 | 4
-  kyoku_mode?: KyokuMode
-  /** RFC3339 timestamp; inclusive. */
-  started_after?: string
-  /** RFC3339 timestamp; exclusive. */
-  started_before?: string
-}
-
-export type HistoryEvent =
-  | { kind: 'recorded'; record: GameRecord }
-  | { kind: 'deleted'; id: string }
-
-// ---------- Logs ----------
-//
-// Mirrors `crate::schema::ipc::{LogEntry, LogSessionInfo, ReadLogRequest,
-// ReadLogResponse}`. The same shape is used both for entries read off
-// disk (`read_log_session`) and for live-tailed entries delivered over a
-// `tauri::ipc::Channel` (`subscribe_log_events`) — initial-load and live
-// arrivals merge into the same UI list without translation.
-
-export type LogLevel = 'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
-
-export type LogEntry = {
-  ts_ms: number
-  /** One of `LogLevel`, but kept open as `string` because backend may add levels. */
-  level: string
-  target: string
-  file?: string
-  line?: number
-  message: string
-  fields?: Record<string, unknown>
-}
-
-export type LogSessionInfo = {
-  name: string
-  path: string
-  size_bytes: number
-  mtime_ms: number
-  is_active: boolean
-}
-
-export type ReadLogRequest = {
-  session: string
-  offset?: number
-  limit?: number
-  levels?: string[]
-  /** Target prefixes; any-match (OR). */
-  targets?: string[]
-  /** Case-insensitive substring on `message`. */
-  search?: string
-}
-
-export type ReadLogResponse = {
-  entries: LogEntry[]
-  has_more: boolean
-  skipped_malformed: number
-}
-
-// ---------- Inspector ----------
-//
-// Mirrors `crate::schema::inspector::*` and `crate::schema::ipc::ReadInspector*`.
-// Tagged on `kind` — switch on the discriminant to render kind-specific
-// detail panels. Same shape arrives via `subscribe_inspector` (live tail)
-// and `read_inspector` (past sessions), so renderers don't fork.
-
-export type FrameDirection = 'up' | 'down'
-
-export type FrameRaw =
-  | { format: 'text'; data: string }
-  | { format: 'binary'; data: string } // base64
-
-export type ParsedFrame = {
-  method: string
-  args: unknown
-}
-
-export type BotReactionPayload = {
-  bot: string
-  actor_id: number
-  trigger: MjaiEvent
-  action: MjaiEvent
-  meta?: Record<string, unknown>
-  reaction_ms: number
-}
-
-/** Which capture backend observed an event. */
-export type CaptureSource = 'mitm' | 'chromium'
-
-export type HttpPhase = 'request' | 'response'
-
-export type HttpHeader = {
-  name: string
-  value: string
-}
-
-/** A body we kept, or the reason we did not. */
-export type HttpBody = {
-  text?: string
-  bytes?: number
-  /** Absent when the body was captured whole. */
-  skipped?: string
-}
-
-/**
- * A recognizer's reading of an exchange. Vendor-specific vocabulary lives
- * in `data` — never in the exchange itself — so a new recognizer needs no
- * change here.
- */
-export type HttpAnnotation = {
-  kind: string
-  summary: string
-  data: unknown
-}
-
-export type InspectorEntry =
-  | {
-      kind: 'ws_frame'
-      ts_ms: number
-      direction: FrameDirection
-      flow_id: string
-      size: number
-      raw: FrameRaw
-      parsed?: ParsedFrame
-      emitted: number
-    }
-  | {
-      kind: 'mjai_event'
-      ts_ms: number
-      event: MjaiEvent
-    }
-  | {
-      kind: 'bot_reaction'
-      ts_ms: number
-      // Backend serializes BotReaction with #[serde(flatten)], so its
-      // fields land at the top level of the row alongside `kind` and
-      // `ts_ms`.
-      bot: string
-      actor_id: number
-      trigger: MjaiEvent
-      action: MjaiEvent
-      meta?: Record<string, unknown>
-      reaction_ms: number
-    }
-  | {
-      kind: 'http'
-      ts_ms: number
-      source: CaptureSource
-      // Backend serializes HttpExchange with #[serde(flatten)], so its
-      // fields land at the top level of the row, same as bot_reaction.
-      exchange_id?: string
-      phase: HttpPhase
-      method: string
-      url: string
-      host: string
-      version: string
-      status?: number
-      headers: HttpHeader[]
-      body?: HttpBody
-      annotations?: HttpAnnotation[]
-    }
-
-export type InspectorKind = InspectorEntry['kind']
-
-export type ReadInspectorRequest = {
-  session: string
-  offset?: number
-  limit?: number
-  kinds?: InspectorKind[]
-  actor?: number
-  search?: string
-}
-
-export type ReadInspectorResponse = {
-  entries: InspectorEntry[]
-  has_more: boolean
-  skipped_malformed: number
-}

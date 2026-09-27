@@ -158,27 +158,6 @@ pub enum CaptureStatus {
     },
 }
 
-// ---------- HoraScoreInfo ----------
-
-/// Bot's hora-decision score breakdown, computed on demand by
-/// `commands::compute_bot_hora_score`. Returned as `Option<Self>` —
-/// `None` when no game is in progress, the actor's hand isn't a valid
-/// agari shape, or the winning tile can't be inferred from the live state.
-///
-/// `points` is the actor's *received* total: for ron, the discarder's pay;
-/// for tsumo, the sum across all paying seats. Honba/riichi-stick payouts
-/// are NOT folded in (those depend on platform settlement).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HoraScoreInfo {
-    pub points: u32,
-    pub han: u32,
-    pub fu: u32,
-    pub yakuman: bool,
-    /// mjai tile string (e.g. `"5mr"`, `"C"`) — the tile the actor wins on.
-    /// For ron this is the most recent discard; for tsumo the most recent draw.
-    pub win_tile: String,
-}
-
 // ---------- Snapshot / BotInfo ----------
 //
 // Returned by `commands::get_status` and `commands::list_bots`. These
@@ -234,10 +213,7 @@ pub struct Snapshot {
 // ---------- Logs ----------
 //
 // One canonical shape for an emitted tracing event: written to disk as a
-// line of `all.jsonl` AND broadcast to the frontend log viewer over a
-// `tauri::ipc::Channel`. Keeping disk and wire shapes identical means the
-// initial-load reader and the live-tail subscriber feed the same UI rows
-// without a translation step.
+// line of `all.jsonl`. The JSONL file is the only consumer.
 
 /// One log event. `ts_ms` is millisecond Unix time (local clock at emit).
 /// `fields` carries the structured fields recorded via `tracing` (the
@@ -254,79 +230,6 @@ pub struct LogEntry {
     pub message: String,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub fields: HashMap<String, serde_json::Value>,
-}
-
-/// Metadata for one log session directory under `<log_root>/`. Sorted
-/// newest-first by `name` (timestamp). `is_active` marks the session
-/// owned by the running process — the UI uses this to enable live tail.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LogSessionInfo {
-    pub name: String,
-    pub path: PathBuf,
-    pub size_bytes: u64,
-    pub mtime_ms: i64,
-    pub is_active: bool,
-}
-
-/// Filtered, paginated read against a single session's `all.jsonl`.
-/// `limit` is capped server-side at 2000 to bound payload size.
-/// `levels`/`targets`/`search` are AND-ed; within each, multiple entries
-/// are OR-ed (level in set; any target prefix matches; substring on
-/// `message` is case-insensitive).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ReadLogRequest {
-    pub session: String,
-    #[serde(default)]
-    pub offset: usize,
-    #[serde(default)]
-    pub limit: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub levels: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub targets: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub search: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadLogResponse {
-    pub entries: Vec<LogEntry>,
-    pub has_more: bool,
-    pub skipped_malformed: u32,
-}
-
-// ---------- Inspector ----------
-//
-// Mirrors the on-disk `<session>/inspector.jsonl` shape for past-session
-// reads. Same `kind` filtering / pagination model as `ReadLogRequest`.
-
-/// Filtered, paginated read against a session's `inspector.jsonl`.
-/// `kinds` accepts `"ws_frame"`, `"mjai_event"`, `"bot_reaction"`.
-/// `actor` filters records that reference an actor (mjai events with an
-/// `actor` field; bot reactions by `actor_id`); ws frames are
-/// always included regardless of actor unless `kinds` excludes them.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ReadInspectorRequest {
-    pub session: String,
-    #[serde(default)]
-    pub offset: usize,
-    #[serde(default)]
-    pub limit: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kinds: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actor: Option<u8>,
-    /// Case-insensitive substring on the entry's text representation
-    /// (frame raw text, mjai event JSON, bot action JSON).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub search: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReadInspectorResponse {
-    pub entries: Vec<crate::schema::InspectorEntry>,
-    pub has_more: bool,
-    pub skipped_malformed: u32,
 }
 
 #[cfg(test)]

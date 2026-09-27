@@ -5,28 +5,21 @@
 //! a toast. Keep the JSON shape conservative — clients lock onto field
 //! names quickly and renames break dashboards.
 
-use crate::analysis::result::AnalysisResult;
 use crate::bot::install::{self, GithubInstallSpec, LocalZipInstallSpec};
-use crate::bot::manifest::{self, BotSource};
+use crate::bot::manifest;
 use crate::bot::runtime;
 use crate::bot::sync_guard::SyncGuard;
 use crate::bot::{BotEntry, BotRegistry};
 use crate::config::AppConfig;
-use crate::game_state::mahgen_view::MahgenView;
-use crate::game_state::snapshot::GameStateSnapshot;
 use crate::ipc::capture_supervisor::{
     restart_capture as restart_capture_inner, spawn_capture_supervisor,
 };
 use crate::ipc::overlay;
 use crate::ipc::state::AppState;
-use crate::schema::{
-    BotInfo, BotSettings, GameRecord, HistoryEvent, HistoryEventLog, HistoryFilter, HoraScoreInfo,
-    InspectorEntry, LogEntry, LogSessionInfo, Notification, ReadInspectorRequest,
-    ReadInspectorResponse, ReadLogRequest, ReadLogResponse, Snapshot,
-};
+use crate::schema::{BotInfo, BotSettings, Notification, Snapshot};
 use crate::util::resolve_dir;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tauri::{AppHandle, State};
 
 /// Returns `true` exactly once per process the first time `bot_enabled`
@@ -68,6 +61,134 @@ fn entry_to_info(e: &BotEntry) -> BotInfo {
 
 type CmdResult<T> = Result<T, String>;
 
+/// Start an auto-queue autoplay session (Riichi City): after each finished
+/// game the next match is queued automatically, until `games` games have
+/// been played (`None` = until stopped). Requires autoplay enabled, the
+/// Riichi City platform, and no game in progress (a running game is
+/// already being played by autoplay — the session would miscount it).
+#[tauri::command]
+pub async fn autoplay_session_start(
+    games: Option<u32>,
+    state: State<'_, AppState>,
+) -> CmdResult<crate::autoplay::session::AutoplaySessionStatus> {
+    {
+        let cfg = state.config.read().await;
+        if !cfg.autoplay.enabled {
+            return Err(
+                "Enable autoplay (Settings → Autoplay) before starting a session".to_string(),
+            );
+        }
+        if cfg.platform.kind != crate::config::Platform::RiichiCity {
+            return Err("Auto-queuing is currently only supported for Riichi City".to_string());
+        }
+    }
+    if !state
+        .autoplay_manager_started
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return Err(
+            "The autoplay manager is not running — toggle autoplay on and try again".to_string(),
+        );
+    }
+    if state.autoplay_context.inject.in_game() {
+        return Err(
+            "A game is in progress — start the session from the lobby, or after this \
+             game ends (autoplay is already playing it)"
+                .to_string(),
+        );
+    }
+    state
+        .autoplay_context
+        .session
+        .start(games)
+        .map_err(|e| e.to_string())?;
+    // No game in progress: book the first match right away.
+    let config_dir = state
+        .config_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    crate::autoplay::manager::spawn_queue_task(
+        state.config.clone(),
+        state.autoplay_context.inject.clone(),
+        state.autoplay_context.session.clone(),
+        state.notify_bus.clone(),
+        config_dir,
+    );
+    Ok(state.autoplay_context.session.status())
+}
+
+/// The stop button: the game in progress plays out; no further match is
+/// queued.
+#[tauri::command]
+pub async fn autoplay_session_stop(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::autoplay::session::AutoplaySessionStatus> {
+    state.autoplay_context.session.stop("stopped by user");
+    Ok(state.autoplay_context.session.status())
+}
+
+#[tauri::command]
+pub async fn autoplay_session_status(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::autoplay::session::AutoplaySessionStatus> {
+    Ok(state.autoplay_context.session.status())
+}
+
+/// The ranked rooms + the player's raw rank context from the server.
+/// The classify list alone doesn't gate rooms (all four always appear);
+/// the player's stage level in `userInfo` is what the client's UI uses
+/// to decide which room to offer.
+#[tauri::command]
+pub async fn riichi_city_available_rooms(
+    state: State<'_, AppState>,
+) -> CmdResult<serde_json::Value> {
+    use crate::bridge::riichi_city::lobby;
+
+    let rc = state.config.read().await.autoplay.riichi_city.clone();
+    let creds = state
+        .autoplay_context
+        .inject
+        .lobby_credentials()
+        .ok_or_else(|| {
+            "Not connected — log into Riichi City with capture running to detect \
+             available rooms"
+                .to_string()
+        })?;
+    let config_dir = state
+        .config_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    let deviceid = lobby::load_or_create_device_id(&config_dir)
+        .map_err(|e| format!("could not persist the lobby device id: {e:#}"))?;
+    let client = lobby::LobbyClient::new(
+        rc.queue_web_base
+            .as_deref()
+            .unwrap_or(lobby::DEFAULT_WEB_BASE),
+        lobby::LobbyAuth::from_credentials(&creds, deviceid, rc.channel.clone()),
+    );
+    let (_classifies, user_info) = client
+        .read_classifies_with_user()
+        .await
+        .map_err(|e| format!("could not read the ranked-room list: {e:#}"))?;
+
+    // Prefer the level-based gate (the server returns all classifies
+    // regardless of rank; the client's UI filters using stageLevelMap).
+    let rooms: Vec<String> = user_info
+        .as_ref()
+        .and_then(lobby::stage_level_from_user_info)
+        .map(|level| {
+            lobby::rooms_for_stage_level(level)
+                .into_iter()
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(serde_json::json!({ "rooms": rooms }))
+}
+
 #[tauri::command]
 pub async fn get_config(state: State<'_, AppState>) -> CmdResult<AppConfig> {
     Ok(state.config.read().await.clone())
@@ -99,7 +220,6 @@ pub async fn update_config(
     let capture_changed = prev_capture != new_config.capture;
     let proxy_changed = prev_proxy != new_config.proxy;
     let platform_changed = prev_platform != new_config.platform.kind;
-    let new_platform = new_config.platform.kind;
     let bot_now_enabled = new_config.bot.enabled;
     let autoplay_now_enabled = new_config.autoplay.enabled;
     let new_overlay = new_config.overlay.clone();
@@ -107,17 +227,6 @@ pub async fn update_config(
 
     // Open / close / retune the overlay window to match what was just saved.
     overlay::reconcile(&app, &new_overlay);
-
-    // Sync the history recorder's platform tag immediately. Subsequent
-    // finalised games are stamped with the new tag; the in-flight buffer
-    // (if any) keeps the tag it had at start_game — acceptable, since
-    // mid-game platform switches are not a real workflow.
-    if platform_changed {
-        *state
-            .history_platform
-            .write()
-            .expect("history platform lock poisoned") = crate::schema::Platform::from(new_platform);
-    }
 
     if capture_changed || proxy_changed || platform_changed {
         // Run the restart in the background — `update_config` returns
@@ -429,55 +538,6 @@ pub async fn install_bot_from_zip(
     Ok(entry_to_info(&entry))
 }
 
-/// Reinstall a bot from the GitHub source declared in its existing
-/// `manifest.toml`. Removes the current install first.
-#[tauri::command]
-pub async fn update_bot_from_manifest(
-    name: String,
-    state: State<'_, AppState>,
-) -> CmdResult<BotInfo> {
-    let (dir, net) = {
-        let cfg = state.config.read().await;
-        (cfg.bot.dir.clone(), cfg.network.clone())
-    };
-    let resolved = resolve_dir(Path::new(&dir));
-    let registry = BotRegistry::scan(&resolved).map_err(|e| format!("scan bots: {e:#}"))?;
-    let entry = registry
-        .find(&name)
-        .ok_or_else(|| format!("bot {name:?} not found"))?;
-    let manifest = entry
-        .manifest
-        .as_ref()
-        .ok_or_else(|| format!("bot {name:?} has no manifest.toml"))?;
-    let source = manifest
-        .source
-        .as_ref()
-        .ok_or_else(|| format!("bot {name:?} manifest has no [bot.source] block"))?;
-
-    let (repo, asset_glob) = match source {
-        BotSource::GithubRelease { repo, asset_glob } => (repo.clone(), asset_glob.clone()),
-    };
-
-    std::fs::remove_dir_all(&entry.dir)
-        .map_err(|e| format!("remove old install {}: {e}", entry.dir.display()))?;
-
-    let spec = GithubInstallSpec {
-        repo,
-        asset_glob,
-        name: Some(name.clone()),
-    };
-    let new_entry = install::install_from_github_release(
-        spec,
-        &resolved,
-        &state.notify_bus,
-        state.runtime.as_ref(),
-        &net,
-    )
-    .await
-    .map_err(|e| format!("install: {e:#}"))?;
-    Ok(entry_to_info(&new_entry))
-}
-
 /// Re-run `uv sync` for an installed bot. Frontend wires this to the
 /// "Reinstall environment" button under Configure. `force=true` wipes
 /// `.akagi/synced.stamp` and `.akagi/venv` first so a corrupted venv is
@@ -660,56 +720,6 @@ pub async fn get_status(state: State<'_, AppState>) -> CmdResult<Snapshot> {
     })
 }
 
-/// One-shot read of the latest [`crate::schema::CaptureStatus`]. Cheaper
-/// than `get_status` when the caller only needs the capture lifecycle.
-#[tauri::command]
-pub async fn get_capture_status(
-    state: State<'_, AppState>,
-) -> CmdResult<crate::schema::CaptureStatus> {
-    Ok(state.capture_control.lock().await.status.clone())
-}
-
-#[tauri::command]
-pub async fn get_log_dir(state: State<'_, AppState>) -> CmdResult<PathBuf> {
-    Ok(state.log_session.dir().to_path_buf())
-}
-
-/// Best-effort "open this folder in the OS file manager". Spawns the
-/// platform-native opener and returns immediately — we don't wait on the
-/// child, so a missing tool surfaces only if `spawn` itself fails. The
-/// frontend already wraps this in try/catch.
-#[tauri::command]
-pub async fn open_log_folder(session: Option<String>, state: State<'_, AppState>) -> CmdResult<()> {
-    let target = match session {
-        Some(name) if !name.is_empty() => {
-            // Defense-in-depth: only allow the canonical session name
-            // shape — no `..`, no separators — so a malicious frontend
-            // can't redirect this to anywhere else on disk.
-            if !is_session_name(&name) {
-                return Err(format!("invalid session name {name:?}"));
-            }
-            state.log_session.root().join(name)
-        }
-        _ => state.log_session.dir().to_path_buf(),
-    };
-    open_path(&target)
-}
-
-fn open_path(path: &Path) -> CmdResult<()> {
-    #[cfg(target_os = "linux")]
-    let cmd = "xdg-open";
-    #[cfg(target_os = "macos")]
-    let cmd = "open";
-    #[cfg(target_os = "windows")]
-    let cmd = "explorer";
-
-    std::process::Command::new(cmd)
-        .arg(path)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("open path {}: {e}", path.display()))
-}
-
 /// Opens an `http(s)://` URL in the user's default browser. Used by the
 /// first-run wizard's GitHub / Discord links and the purchase flow's PayPal
 /// approve page — Tauri 2's webview won't reliably honour `target="_blank"`
@@ -733,489 +743,6 @@ pub async fn open_external_url(url: String) -> CmdResult<()> {
     })
     .await
     .map_err(|e| format!("open url task: {e}"))?
-}
-
-/// Strict matcher for session directory names — `YYYYMMDD-HHMMSS`. Used
-/// both to filter `list_log_sessions` output and to validate user-
-/// supplied session names before they touch the filesystem.
-fn is_session_name(name: &str) -> bool {
-    if name.len() != 15 {
-        return false;
-    }
-    let bytes = name.as_bytes();
-    bytes.iter().enumerate().all(|(i, &b)| {
-        if i == 8 {
-            b == b'-'
-        } else {
-            b.is_ascii_digit()
-        }
-    })
-}
-
-/// List every session directory under the active log root. Newest first.
-/// `is_active` marks the session this process is currently writing — the
-/// UI uses it to enable live tail.
-#[tauri::command]
-pub async fn list_log_sessions(state: State<'_, AppState>) -> CmdResult<Vec<LogSessionInfo>> {
-    let active_name = state
-        .log_session
-        .dir()
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.to_string())
-        .unwrap_or_default();
-    let root = state.log_session.root().to_path_buf();
-
-    tokio::task::spawn_blocking(move || -> Result<Vec<LogSessionInfo>, String> {
-        let mut out = Vec::new();
-        let rd = match std::fs::read_dir(&root) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(format!("read_dir {}: {e}", root.display())),
-        };
-        for entry in rd.flatten() {
-            let Ok(ft) = entry.file_type() else { continue };
-            if !ft.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !is_session_name(&name) {
-                continue;
-            }
-            let path = entry.path();
-            // Cheap directory size: sum file sizes in the immediate dir.
-            // Sub-directories (per-platform flow logs) are NOT walked —
-            // for the UI it's enough to be a rough indicator, and a
-            // recursive walk on a session with thousands of game files
-            // would block the picker.
-            let mut size_bytes: u64 = 0;
-            if let Ok(rd2) = std::fs::read_dir(&path) {
-                for f in rd2.flatten() {
-                    if let Ok(m) = f.metadata() {
-                        if m.is_file() {
-                            size_bytes += m.len();
-                        }
-                    }
-                }
-            }
-            let mtime_ms = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let is_active = name == active_name;
-            out.push(LogSessionInfo {
-                name,
-                path,
-                size_bytes,
-                mtime_ms,
-                is_active,
-            });
-        }
-        out.sort_by(|a, b| b.name.cmp(&a.name));
-        Ok(out)
-    })
-    .await
-    .map_err(|e| format!("list_log_sessions join: {e}"))?
-}
-
-/// Read filtered, paginated entries from one session's `all.jsonl`.
-///
-/// Filtering is server-side so a frontend opening a 100k-line session can
-/// still ask "just the errors" without dragging the whole file across the
-/// wire. The reader is line-oriented — one bad line is counted under
-/// `skipped_malformed` and skipped, so a partial trailing line in the
-/// active session (still being written) doesn't poison the response.
-/// `limit` is capped at 2000 to bound payload size.
-#[tauri::command]
-pub async fn read_log_session(
-    req: ReadLogRequest,
-    state: State<'_, AppState>,
-) -> CmdResult<ReadLogResponse> {
-    if !is_session_name(&req.session) {
-        return Err(format!("invalid session name {:?}", req.session));
-    }
-    let root = state.log_session.root().to_path_buf();
-
-    tokio::task::spawn_blocking(move || -> Result<ReadLogResponse, String> {
-        let path = root.join(&req.session).join("all.jsonl");
-        let file = match std::fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ReadLogResponse {
-                    entries: Vec::new(),
-                    has_more: false,
-                    skipped_malformed: 0,
-                });
-            }
-            Err(e) => return Err(format!("open {}: {e}", path.display())),
-        };
-        let reader = std::io::BufReader::new(file);
-        use std::io::BufRead;
-
-        let level_set: Option<std::collections::HashSet<String>> =
-            req.levels.as_ref().map(|v| v.iter().cloned().collect());
-        let target_filters: Vec<String> = req.targets.unwrap_or_default();
-        let search_lc = req.search.as_deref().map(|s| s.to_lowercase());
-        // 0 → use a sane default (1000); otherwise hard-cap at 2000.
-        let limit = if req.limit == 0 {
-            1000
-        } else {
-            req.limit.min(2000)
-        };
-
-        let mut skipped_malformed: u32 = 0;
-        let mut total_match: usize = 0;
-        let mut entries: Vec<LogEntry> = Vec::with_capacity(limit);
-
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let entry: LogEntry = match serde_json::from_str(trimmed) {
-                Ok(e) => e,
-                Err(_) => {
-                    skipped_malformed += 1;
-                    continue;
-                }
-            };
-            if let Some(ref ls) = level_set {
-                if !ls.contains(&entry.level) {
-                    continue;
-                }
-            }
-            if !target_filters.is_empty()
-                && !target_filters.iter().any(|t| entry.target.starts_with(t))
-            {
-                continue;
-            }
-            if let Some(ref s) = search_lc {
-                if !entry.message.to_lowercase().contains(s) {
-                    continue;
-                }
-            }
-            total_match += 1;
-            if total_match > req.offset && entries.len() < limit {
-                entries.push(entry);
-            }
-        }
-
-        let has_more = total_match > req.offset + entries.len();
-        Ok(ReadLogResponse {
-            entries,
-            has_more,
-            skipped_malformed,
-        })
-    })
-    .await
-    .map_err(|e| format!("read_log_session join: {e}"))?
-}
-
-/// Read filtered, paginated entries from a session's `inspector.jsonl`.
-/// Same line-oriented, fault-tolerant reader as `read_log_session` —
-/// malformed lines bumped under `skipped_malformed`, `limit` capped at
-/// 2000. Filtering is server-side so a session with hundreds of
-/// thousands of events doesn't have to cross the wire to be narrowed.
-#[tauri::command]
-pub async fn read_inspector(
-    req: ReadInspectorRequest,
-    state: State<'_, AppState>,
-) -> CmdResult<ReadInspectorResponse> {
-    if !is_session_name(&req.session) {
-        return Err(format!("invalid session name {:?}", req.session));
-    }
-    let root = state.log_session.root().to_path_buf();
-
-    tokio::task::spawn_blocking(move || -> Result<ReadInspectorResponse, String> {
-        let path = root.join(&req.session).join("inspector.jsonl");
-        let file = match std::fs::File::open(&path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ReadInspectorResponse {
-                    entries: Vec::new(),
-                    has_more: false,
-                    skipped_malformed: 0,
-                });
-            }
-            Err(e) => return Err(format!("open {}: {e}", path.display())),
-        };
-        let reader = std::io::BufReader::new(file);
-        use std::io::BufRead;
-
-        let kind_set: Option<std::collections::HashSet<String>> =
-            req.kinds.as_ref().map(|v| v.iter().cloned().collect());
-        let actor = req.actor;
-        let search_lc = req.search.as_deref().map(|s| s.to_lowercase());
-        let limit = if req.limit == 0 {
-            1000
-        } else {
-            req.limit.min(2000)
-        };
-
-        let mut skipped_malformed: u32 = 0;
-        let mut total_match: usize = 0;
-        let mut entries: Vec<InspectorEntry> = Vec::with_capacity(limit);
-
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let entry: InspectorEntry = match serde_json::from_str(trimmed) {
-                Ok(e) => e,
-                Err(_) => {
-                    skipped_malformed += 1;
-                    continue;
-                }
-            };
-            if !inspector_matches(&entry, kind_set.as_ref(), actor, search_lc.as_deref()) {
-                continue;
-            }
-            total_match += 1;
-            if total_match > req.offset && entries.len() < limit {
-                entries.push(entry);
-            }
-        }
-
-        let has_more = total_match > req.offset + entries.len();
-        Ok(ReadInspectorResponse {
-            entries,
-            has_more,
-            skipped_malformed,
-        })
-    })
-    .await
-    .map_err(|e| format!("read_inspector join: {e}"))?
-}
-
-/// Predicate factored out of `read_inspector` so the filtering rules are
-/// in one place (and easy to test, when we add tests for the inspector
-/// pipeline). `kind_set` matches against the `kind` discriminant; `actor`
-/// matches mjai events with an `actor` field and bot reactions by
-/// `actor_id`; ws frames are unaffected by the actor filter (they're
-/// pre-bridge, no actor concept yet) — they only drop out via `kinds`.
-fn inspector_matches(
-    entry: &InspectorEntry,
-    kind_set: Option<&std::collections::HashSet<String>>,
-    actor: Option<u8>,
-    search_lc: Option<&str>,
-) -> bool {
-    let kind = match entry {
-        InspectorEntry::WsFrame { .. } => "ws_frame",
-        InspectorEntry::MjaiEvent { .. } => "mjai_event",
-        InspectorEntry::BotReaction { .. } => "bot_reaction",
-        InspectorEntry::Http { .. } => "http",
-    };
-    if let Some(ks) = kind_set {
-        if !ks.contains(kind) {
-            return false;
-        }
-    }
-    if let Some(a) = actor {
-        match entry {
-            InspectorEntry::WsFrame { .. } => {} // pre-bridge, no actor
-            // Describes the client, not any seat — same treatment as a
-            // ws frame: only the `kinds` filter can drop it.
-            InspectorEntry::Http { .. } => {}
-            InspectorEntry::MjaiEvent { event, .. } => {
-                if let Some(ev_actor) = mjai_event_actor(event) {
-                    if ev_actor != a {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
-            }
-            InspectorEntry::BotReaction { reaction, .. } => {
-                if reaction.actor_id != a {
-                    return false;
-                }
-            }
-        }
-    }
-    if let Some(s) = search_lc {
-        let hay = match entry {
-            InspectorEntry::WsFrame { raw, parsed, .. } => {
-                let mut buf = match raw {
-                    crate::schema::FrameRaw::Text(t) => t.to_lowercase(),
-                    crate::schema::FrameRaw::Binary(b) => b.to_lowercase(),
-                };
-                if let Some(p) = parsed {
-                    buf.push(' ');
-                    buf.push_str(&p.method.to_lowercase());
-                    buf.push(' ');
-                    buf.push_str(&p.args.to_string().to_lowercase());
-                }
-                buf
-            }
-            InspectorEntry::MjaiEvent { event, .. } => serde_json::to_string(event)
-                .unwrap_or_default()
-                .to_lowercase(),
-            InspectorEntry::BotReaction { reaction, .. } => serde_json::to_string(reaction)
-                .unwrap_or_default()
-                .to_lowercase(),
-            // The whole exchange, so a search for a URL, a header, a
-            // status, or anything a recognizer decoded all hit.
-            InspectorEntry::Http { exchange, .. } => serde_json::to_string(exchange)
-                .unwrap_or_default()
-                .to_lowercase(),
-        };
-        if !hay.contains(s) {
-            return false;
-        }
-    }
-    true
-}
-
-fn mjai_event_actor(event: &crate::schema::MjaiEvent) -> Option<u8> {
-    use crate::schema::MjaiEvent as E;
-    match event {
-        E::Tsumo { actor, .. }
-        | E::Dahai { actor, .. }
-        | E::Chi { actor, .. }
-        | E::Pon { actor, .. }
-        | E::Daiminkan { actor, .. }
-        | E::Kakan { actor, .. }
-        | E::Ankan { actor, .. }
-        | E::Reach { actor, .. }
-        | E::ReachAccepted { actor }
-        | E::Hora { actor, .. }
-        | E::Kita { actor, .. } => Some(*actor),
-        _ => None,
-    }
-}
-
-/// Subscribe to live inspector events. Same shape and lossy semantics as
-/// `subscribe_log_events`. The Logs → Inspector tab uses this for the
-/// active session's live tail.
-#[tauri::command]
-pub async fn subscribe_inspector(
-    state: State<'_, AppState>,
-    on_event: tauri::ipc::Channel<InspectorEntry>,
-) -> CmdResult<()> {
-    let mut rx = state.log_session.subscribe_inspector();
-    tauri::async_runtime::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(entry) => {
-                    let _ = on_event.send(entry);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    // Inject a synthetic mjai-event-shaped warn marker so
-                    // the UI sees the gap. We piggyback on MjaiEvent::None
-                    // — the inspector tab knows to render dropped-event
-                    // markers when it sees `none` interleaved.
-                    let warn = InspectorEntry::MjaiEvent {
-                        ts_ms: chrono::Local::now().timestamp_millis(),
-                        event: crate::schema::MjaiEvent::None,
-                    };
-                    let _ = on_event.send(warn);
-                    tracing::warn!(
-                        target: "akagi.inspector",
-                        "inspector forwarder dropped {n} entries"
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            }
-        }
-    });
-    Ok(())
-}
-
-/// Subscribe to live log events. Each event the active session emits is
-/// forwarded over the supplied `tauri::ipc::Channel`. Slow consumers
-/// surface a synthetic `WARN akagi.logger "dropped N events…"` so the
-/// UI can show the gap explicitly. The forwarder task lives until the
-/// broadcast is closed (process shutdown).
-#[tauri::command]
-pub async fn subscribe_log_events(
-    state: State<'_, AppState>,
-    on_event: tauri::ipc::Channel<LogEntry>,
-) -> CmdResult<()> {
-    let mut rx = state.log_session.subscribe();
-    tauri::async_runtime::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(entry) => {
-                    let _ = on_event.send(entry);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    let warn = LogEntry {
-                        ts_ms: chrono::Local::now().timestamp_millis(),
-                        level: "WARN".into(),
-                        target: "akagi.logger".into(),
-                        file: None,
-                        line: None,
-                        message: format!("dropped {n} log events (consumer too slow)"),
-                        fields: std::collections::HashMap::new(),
-                    };
-                    let _ = on_event.send(warn);
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            }
-        }
-    });
-    Ok(())
-}
-
-/// Latest analysis output. `None` until the analysis runner has produced
-/// at least one result for the current game.
-#[tauri::command]
-pub async fn get_analysis(state: State<'_, AppState>) -> CmdResult<Option<AnalysisResult>> {
-    Ok(state.analysis_cache.read().await.clone())
-}
-
-/// Live game-state snapshot from the tracker. `None` before any
-/// `start_game` event has been observed.
-#[tauri::command]
-pub async fn get_game_snapshot(state: State<'_, AppState>) -> CmdResult<Option<GameStateSnapshot>> {
-    Ok(state.game_tracker.lock().await.snapshot())
-}
-
-/// Score a hypothetical bot hora (ron or tsumo) against the live engine
-/// state. The bot's own `hora` mjai response carries no score data
-/// (`deltas` is only populated on the inbound mjai event from the platform
-/// after the win is confirmed). The frontend's `BotActionTile` calls this
-/// to display "+8000點" beside the action label.
-///
-/// Returns `None` when no game is in progress, when the actor's hand isn't
-/// a valid agari shape, or when the winning tile can't be inferred from
-/// the live state (no recent discard for ron / no recent draw for tsumo).
-#[tauri::command]
-pub async fn compute_bot_hora_score(
-    actor: u8,
-    is_tsumo: bool,
-    state: State<'_, AppState>,
-) -> CmdResult<Option<HoraScoreInfo>> {
-    Ok(state
-        .game_tracker
-        .lock()
-        .await
-        .evaluate_hora(actor, is_tsumo))
-}
-
-/// Pre-encoded mahgen DSL strings ready for the frontend `<mah-gen>`
-/// element. Built from the same snapshot as `get_game_snapshot` — call
-/// whichever the UI surface prefers; both are O(34 tiles) to generate.
-#[tauri::command]
-pub async fn get_mahgen_view(state: State<'_, AppState>) -> CmdResult<Option<MahgenView>> {
-    Ok(state
-        .game_tracker
-        .lock()
-        .await
-        .snapshot()
-        .map(|s| MahgenView::from_snapshot(&s)))
 }
 
 /// Remove a bot's directory under `bot.dir/<name>/`. Refuses to delete
@@ -1258,75 +785,6 @@ pub async fn delete_bot(name: String, state: State<'_, AppState>) -> CmdResult<(
         .notify_bus
         .send(Notification::success(format!("Deleted bot {name}")));
     Ok(())
-}
-
-// ---------- Game history ----------
-//
-// Reads/writes are delegated to `state.history_store`. All errors bubble
-// up as user-readable strings (the store error chain via anyhow has the
-// detail we need; `:#` prints the full chain).
-
-/// Filtered, paginated listing of finalised games. Newest-first by
-/// `started_at`. `limit == 0` means use the store's default cap.
-#[tauri::command]
-pub async fn list_game_history(
-    filter: Option<HistoryFilter>,
-    limit: Option<u32>,
-    offset: Option<u32>,
-    state: State<'_, AppState>,
-) -> CmdResult<Vec<GameRecord>> {
-    let store = state.history_store.clone();
-    let filter = filter.unwrap_or_default();
-    let limit = limit.unwrap_or(0);
-    let offset = offset.unwrap_or(0);
-    tokio::task::spawn_blocking(move || store.list(&filter, limit, offset))
-        .await
-        .map_err(|e| format!("history list join error: {e}"))?
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// Single record by id.
-#[tauri::command]
-pub async fn get_game_history_record(
-    id: String,
-    state: State<'_, AppState>,
-) -> CmdResult<Option<GameRecord>> {
-    let store = state.history_store.clone();
-    tokio::task::spawn_blocking(move || store.get(&id))
-        .await
-        .map_err(|e| format!("history get join error: {e}"))?
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// Full mjai event stream for a recorded game. `None` if the id is unknown.
-#[tauri::command]
-pub async fn get_game_history_events(
-    id: String,
-    state: State<'_, AppState>,
-) -> CmdResult<Option<HistoryEventLog>> {
-    let store = state.history_store.clone();
-    tokio::task::spawn_blocking(move || store.get_events(&id))
-        .await
-        .map_err(|e| format!("history get_events join error: {e}"))?
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// Delete a recorded game (its index entry + games/<id>.mjai.jsonl).
-/// Returns true if a record was actually removed. Emits a
-/// `HistoryEvent::Deleted` on the history bus so the frontend can drop
-/// the row from its cache without a refetch.
-#[tauri::command]
-pub async fn delete_game_history_entry(id: String, state: State<'_, AppState>) -> CmdResult<bool> {
-    let store = state.history_store.clone();
-    let id_for_blocking = id.clone();
-    let removed = tokio::task::spawn_blocking(move || store.delete(&id_for_blocking))
-        .await
-        .map_err(|e| format!("history delete join error: {e}"))?
-        .map_err(|e| format!("{e:#}"))?;
-    if removed {
-        let _ = state.history_bus.send(HistoryEvent::Deleted { id });
-    }
-    Ok(removed)
 }
 
 /// `shinkuan/Akagi` is the canonical upstream — kept here as a const
@@ -1448,142 +906,6 @@ pub async fn native_api_health(
     proxy: Option<String>,
 ) -> CmdResult<crate::bot::api::Health> {
     crate::bot::api::health(&base_url, proxy.as_deref().unwrap_or(""))
-        .await
-        .map_err(|e| format!("{e:#}"))
-}
-
-// ---------- Whole-game review (native API, `/v3/review*`) ----------
-//
-// Same family as the commands above: server URL / key travel as explicit
-// args from the frontend's config store. The submit is the one exception to
-// "thin passthrough" — it loads the recorded mjai log server-side (Rust) so
-// a whole game never round-trips through the webview, and reuses the native
-// bot's censor/shaping helper so `/v3/review` sees the exact same
-// perspective stream `/v3/react` does.
-
-/// Hard cap `POST /v3/review` places on a submitted stream. Checked here so
-/// an oversized log fails with a clear local message instead of a generic
-/// server `400`.
-const REVIEW_MAX_EVENTS: usize = 4096;
-
-/// Submit a recorded history game for whole-game review. `id` is the
-/// history record's ULID; `model` optionally pins the model (empty ⇒ the
-/// server default for the game's player count).
-#[tauri::command]
-pub async fn native_api_review_history_game(
-    base_url: String,
-    proxy: Option<String>,
-    key: String,
-    id: String,
-    model: Option<String>,
-    state: State<'_, AppState>,
-) -> CmdResult<crate::bot::api::ReviewSubmitted> {
-    let store = state.history_store.clone();
-    let record_id = id.clone();
-    let loaded = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        Ok((store.get(&record_id)?, store.get_events(&record_id)?))
-    })
-    .await
-    .map_err(|e| format!("history review join error: {e}"))?
-    .map_err(|e| format!("{e:#}"))?;
-    let (record, events) = loaded;
-    let Some(record) = record else {
-        return Err(format!("history record {id:?} not found"));
-    };
-    // Index entry present but the games/<id>.mjai.jsonl copy is gone —
-    // distinct message so the user isn't told the record doesn't exist.
-    let Some(events) = events else {
-        return Err(format!("event log for history record {id:?} is missing"));
-    };
-    // Observer / replay recordings carry no own-seat; there is no perspective
-    // to review from (and no hand visible to build one).
-    let Some(seat) = record.our_seat else {
-        return Err("record has no player seat; cannot review an observed game".into());
-    };
-
-    let events = crate::bot::native::build_api_events(&events, seat, record.num_players);
-    if events.len() > REVIEW_MAX_EVENTS {
-        return Err(format!(
-            "game log has {} events, over the review limit of {REVIEW_MAX_EVENTS}",
-            events.len()
-        ));
-    }
-
-    // An omitted model resolves to the server's default **4p** model, which
-    // rejects a sanma stream — so a 3p game with no configured model falls
-    // back to the id `"3p"`, which the server documents as resolving to its
-    // default 3p model.
-    let configured = model.as_deref().map(str::trim).filter(|m| !m.is_empty());
-    let model = match configured {
-        Some(m) => Some(m.to_string()),
-        None if record.num_players == 3 => Some("3p".to_string()),
-        None => None,
-    };
-
-    crate::bot::api::ApiClient::new(&base_url, &key, proxy.as_deref().unwrap_or(""))
-        .map_err(|e| format!("{e:#}"))?
-        .submit_review(model.as_deref(), Some(seat), events)
-        .await
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// Poll a review job (`GET /v3/review/{review_id}`). Meta-only — a `done`
-/// job answers with its share URL, which is where the result body lives.
-#[tauri::command]
-pub async fn native_api_review_status(
-    base_url: String,
-    proxy: Option<String>,
-    key: String,
-    review_id: String,
-) -> CmdResult<crate::bot::api::ReviewJobStatus> {
-    crate::bot::api::ApiClient::new(&base_url, &key, proxy.as_deref().unwrap_or(""))
-        .map_err(|e| format!("{e:#}"))?
-        .review_status(&review_id)
-        .await
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// (Re-)issue a review's public share link (`POST /v3/review/{id}/share`).
-#[tauri::command]
-pub async fn native_api_review_share(
-    base_url: String,
-    proxy: Option<String>,
-    key: String,
-    review_id: String,
-) -> CmdResult<crate::bot::api::ShareIssued> {
-    crate::bot::api::ApiClient::new(&base_url, &key, proxy.as_deref().unwrap_or(""))
-        .map_err(|e| format!("{e:#}"))?
-        .review_share(&review_id)
-        .await
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// List this key's live share links (`GET /v3/shares`), newest first.
-#[tauri::command]
-pub async fn native_api_list_shares(
-    base_url: String,
-    proxy: Option<String>,
-    key: String,
-) -> CmdResult<Vec<crate::bot::api::ShareEntry>> {
-    crate::bot::api::ApiClient::new(&base_url, &key, proxy.as_deref().unwrap_or(""))
-        .map_err(|e| format!("{e:#}"))?
-        .shares()
-        .await
-        .map_err(|e| format!("{e:#}"))
-}
-
-/// Revoke a share link (`DELETE /v3/shared/{share_id}`). The review stays
-/// stored; `native_api_review_share` can re-issue a fresh link later.
-#[tauri::command]
-pub async fn native_api_revoke_share(
-    base_url: String,
-    proxy: Option<String>,
-    key: String,
-    share_id: String,
-) -> CmdResult<()> {
-    crate::bot::api::ApiClient::new(&base_url, &key, proxy.as_deref().unwrap_or(""))
-        .map_err(|e| format!("{e:#}"))?
-        .revoke_share(&share_id)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -1749,45 +1071,27 @@ macro_rules! ipc_handlers {
             $crate::ipc::commands::update_bot_settings,
             $crate::ipc::commands::install_bot_from_github,
             $crate::ipc::commands::install_bot_from_zip,
-            $crate::ipc::commands::update_bot_from_manifest,
             $crate::ipc::commands::sync_bot_deps,
             $crate::ipc::commands::delete_bot,
             $crate::ipc::commands::start_capture,
+            $crate::ipc::commands::autoplay_session_start,
+            $crate::ipc::commands::autoplay_session_stop,
+            $crate::ipc::commands::autoplay_session_status,
+            $crate::ipc::commands::riichi_city_available_rooms,
             $crate::ipc::commands::stop_capture,
             $crate::ipc::commands::restart_capture,
-            $crate::ipc::commands::get_capture_status,
             $crate::ipc::commands::detect_system_chrome,
             $crate::ipc::commands::list_cft_installed,
             $crate::ipc::commands::download_chrome_for_testing,
             $crate::ipc::commands::remove_chrome_for_testing,
             $crate::ipc::commands::get_status,
-            $crate::ipc::commands::get_log_dir,
-            $crate::ipc::commands::open_log_folder,
             $crate::ipc::commands::open_external_url,
-            $crate::ipc::commands::list_log_sessions,
-            $crate::ipc::commands::read_log_session,
-            $crate::ipc::commands::subscribe_log_events,
-            $crate::ipc::commands::read_inspector,
-            $crate::ipc::commands::subscribe_inspector,
-            $crate::ipc::commands::get_analysis,
-            $crate::ipc::commands::get_game_snapshot,
-            $crate::ipc::commands::get_mahgen_view,
-            $crate::ipc::commands::compute_bot_hora_score,
-            $crate::ipc::commands::list_game_history,
-            $crate::ipc::commands::get_game_history_record,
-            $crate::ipc::commands::get_game_history_events,
-            $crate::ipc::commands::delete_game_history_entry,
             $crate::ipc::commands::check_for_update,
             $crate::ipc::commands::apply_update,
             $crate::ipc::commands::native_api_redeem,
             $crate::ipc::commands::native_api_key_status,
             $crate::ipc::commands::native_api_models,
             $crate::ipc::commands::native_api_health,
-            $crate::ipc::commands::native_api_review_history_game,
-            $crate::ipc::commands::native_api_review_status,
-            $crate::ipc::commands::native_api_review_share,
-            $crate::ipc::commands::native_api_list_shares,
-            $crate::ipc::commands::native_api_revoke_share,
             $crate::ipc::commands::native_api_create_order,
             $crate::ipc::commands::native_api_order_result,
             $crate::ipc::commands::native_api_create_subscription,

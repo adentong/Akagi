@@ -1,9 +1,7 @@
 import type { ShowItem, ShowMeta } from '@/types'
 
-// Pure helpers for the bot's `meta.show` payload. Used by the Bot Show
-// dashboard tile and by the always-on-top overlay window, which get their data
-// from different places (a zustand store vs. a raw `bot-response` listener) and
-// only agree on shape.
+// Pure helpers for the bot's `meta.show` payload. Used by the always-on-top
+// overlay window, which gets its data from a raw `bot-response` listener.
 
 /** "#aabbcc" → "rgba(170,187,204,a)". Undefined when the input isn't a valid hex. */
 export function hexToRgba(hex: string | null | undefined, alpha: number): string | undefined {

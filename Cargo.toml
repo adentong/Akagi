@@ -54,15 +54,11 @@ riichienv-core = "0.4.8"
 native_bot = { path = "native_bot" }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream", "http2", "charset", "socks"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
-# Gzip for `POST /v3/review` bodies: a whole-game mjai log is hundreds of KB
-# raw, and the review endpoint prefers (and auto-detects) gzipped uploads.
-flate2 = "1"
 globset = "0.4"
 tempfile = "3"
 futures-util = "0.3"
 dirs = "6"
 chromiumoxide = "0.9.1"
-ulid = { version = "1", features = ["serde"] }
 rand = "0.9"
 http = "1"
 http-body-util = "0.1.4"
@@ -83,6 +79,14 @@ opener = { version = "0.8.5", default-features = false }
 rand_distr = "0.5"
 mlua = { version = "0.12.0", features = ["lua54", "vendored", "send", "error-send"] }
 minisign-verify = "0.2.5"
+# Riichi City round advance: sight the settlement OK button in the client
+# window (`autoplay::riichi_city::vision`). xcap captures the window, image
+# decodes the labeled-screenshot fixtures the detector is tested against.
+xcap = "0.4.1"
+image = "0.25"
+# Riichi City lobby API: `analysis_data` payloads are AES-256 encrypted
+# with a key recovered from the shipped Lua (see bridge::riichi_city::lobby).
+aes = "0.8"
 
 # Windows-only: find + terminate a surviving controlled Chromium by its command
 # line when reopening (Chrome writes no SingletonLock file on Windows, so the
