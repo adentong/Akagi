@@ -44,7 +44,7 @@ pub struct AutoplayManager {
     tracker: Arc<Mutex<GameTracker>>,
     mjai_bus: MjaiBus,
     /// For telling the user about a decision that came out wrong — see the
-    /// riichi check in `handle_bot_response` and the dead-click reload.
+    /// riichi check in `handle_bot_response`.
     notify: NotifyBus,
     /// One implementation per supported platform, selected per decision from
     /// the live config so a platform switch takes effect without a restart.
@@ -58,6 +58,10 @@ pub struct AutoplayManager {
     /// User Lua delay policy (hot-reloaded from disk; see
     /// `autoplay::delay::script`).
     delay_script: crate::autoplay::delay::ScriptHost,
+    /// Mirror of the bot manager's our-seat draw count (both count the
+    /// same bus stream). A bot response tagged with a lower value was
+    /// computed from an older draw and must not be acted on.
+    own_tsumo_seq: u64,
     /// Directory holding the loaded config file; the script lives at
     /// `<config_dir>/delay.lua`.
     config_dir: std::path::PathBuf,
@@ -69,9 +73,6 @@ struct ManagerState {
     last_self_tsumo: Option<String>,
     self_riichi_accepted: bool,
     canvas_rect_at: Option<Instant>,
-    /// Decisions in a row where the client accepted nothing we pressed.
-    /// Reset by any input the client does accept.
-    dead_clicks: u32,
     /// Cached seat index for our player. Captured directly from
     /// `StartGame { id }` and kept across kyoku resets. Avoids try_lock
     /// failures in the synchronous mjai event handler causing missed
@@ -104,6 +105,7 @@ impl AutoplayManager {
             riichi: RiichiCityAutoplay::new(),
             state: ManagerState::default(),
             delay_script: crate::autoplay::delay::ScriptHost::default(),
+            own_tsumo_seq: 0,
             config_dir,
         }
     }
@@ -141,6 +143,7 @@ impl AutoplayManager {
                 msg = mjai_rx.recv() => match msg {
                     Ok(ev) => {
                         self.handle_mjai_event(&ev);
+                        self.handle_session_event(&ev).await;
                     }
                     Err(RecvError::Lagged(n)) => warn!("autoplay: mjai bus lagged {n}"),
                     Err(RecvError::Closed) => {
@@ -150,6 +153,72 @@ impl AutoplayManager {
                 },
             }
         }
+    }
+
+    /// Session advance: `StartGame` marks a queued match as landed;
+    /// `EndGame` counts it and queues the next after the inter-game
+    /// delay. (`EndKyoku` is the round-advance watcher's, not ours.)
+    async fn handle_session_event(&mut self, ev: &MjaiEvent) {
+        let session = self.ctx.session.clone();
+        match ev {
+            MjaiEvent::StartGame { .. } => session.note_game_started(),
+            MjaiEvent::EndGame { .. } => {
+                if !session.is_active() {
+                    return;
+                }
+                let status = session.status();
+                if !session.on_game_finished() {
+                    let _ = self.notify.send(
+                        crate::schema::Notification::info("Autoplay session finished").body(
+                            format!(
+                                "Played {} game(s){}; autoplay session ended.",
+                                status.games_completed + 1,
+                                status
+                                    .target_games
+                                    .map(|t| format!(" of {t}"))
+                                    .unwrap_or_default(),
+                            ),
+                        ),
+                    );
+                    return;
+                }
+                self.schedule_next_queue().await;
+            }
+            _ => {}
+        }
+    }
+
+    /// Queue the next Riichi City match: wait for the end screens to show
+    /// (first OK-button sighting), hold a fixed 10s grace, then the
+    /// randomized inter-game delay, then queue. The UI timer runs the
+    /// whole span from the sighting — grace plus delay — so "waiting
+    /// 0:35" means 35 seconds since the score screen appeared.
+    async fn schedule_next_queue(&self) {
+        let rc = self.cfg.read().await.autoplay.riichi_city.clone();
+        let delay = crate::autoplay::session::inter_game_delay(rc.inter_game_delay_ms);
+        info!(
+            "autoplay session: next match ~{}s after the score screen shows",
+            POST_OK_GRACE.as_secs() + delay.as_secs()
+        );
+        let cfg = self.cfg.clone();
+        let inject = self.ctx.inject.clone();
+        let session = self.ctx.session.clone();
+        let notify = self.notify.clone();
+        let config_dir = self.config_dir.clone();
+        tauri::async_runtime::spawn(async move {
+            let generation = session.start_generation();
+            if !wait_for_ok_button(&session, generation).await {
+                return;
+            }
+            session.note_between_games();
+            tokio::time::sleep(POST_OK_GRACE).await;
+            tokio::time::sleep(delay).await;
+            session.clear_between_games();
+            if !session.is_active() || session.start_generation() != generation {
+                return;
+            }
+            run_queue_task(cfg, inject, session, notify, config_dir).await;
+        });
     }
 
     async fn handle_bot_response(&mut self, resp: BotResponse) {
@@ -163,6 +232,26 @@ impl AutoplayManager {
         let delay_cfg = cfg_guard.autoplay.delay.clone();
         let platform_kind = cfg_guard.platform.kind;
         drop(cfg_guard);
+
+        // Stale-response guard (Riichi City): a discard or riichi reply
+        // tagged with an older draw count than the latest our-seat draw
+        // was computed from a superseded turn, which would otherwise
+        // race the real decision and fire a wrong tile into the live
+        // window.
+        if platform_kind == crate::config::Platform::RiichiCity
+            && matches!(
+                resp.action,
+                MjaiEvent::Dahai { .. } | MjaiEvent::Reach { .. }
+            )
+            && resp.own_tsumo_seq.is_some_and(|s| s != self.own_tsumo_seq)
+        {
+            debug!(
+                "autoplay: dropping stale bot response for {:?} — a newer draw \
+                 superseded the turn it was computed from",
+                resp.action
+            );
+            return;
+        }
 
         // Tenhou's planner needs the bridge's hand at Tenhou tile-index
         // resolution; the slot stays empty on every other platform.
@@ -519,42 +608,16 @@ impl AutoplayManager {
             // it, and accepting it would report retries as registered at
             // the exact moments the presses had failed.
             let require_non_discard = !matches!(resp.action, MjaiEvent::Dahai { .. });
-            let registered = self
-                .verify_and_retry(
-                    rect,
-                    &plan,
-                    ticket,
-                    &cfg,
-                    planned_budget,
-                    &resp.action,
-                    require_non_discard,
-                )
-                .await;
-            // Once the client stops accepting presses it tends to stay that
-            // way for the rest of the game — the failures do not come back
-            // one at a time, they arrive and then every remaining decision
-            // runs to timeout. A page reload reconnects into the hand
-            // through the bridge's GameRestore path, so the way out costs a
-            // reconnect rather than the game.
-            if registered {
-                self.state.dead_clicks = 0;
-            } else {
-                self.state.dead_clicks += 1;
-                if cfg.reload_after_failures > 0
-                    && self.state.dead_clicks >= cfg.reload_after_failures
-                {
-                    warn!(
-                        decisions = self.state.dead_clicks,
-                        "autoplay: the client has stopped accepting presses — reloading to recover"
-                    );
-                    let _ = self.notify.send(
-                        crate::schema::Notification::warn("Reloading the game")
-                            .body("Clicks stopped registering; reconnecting to recover."),
-                    );
-                    self.state.dead_clicks = 0;
-                    self.reload_page().await;
-                }
-            }
+            self.verify_and_retry(
+                rect,
+                &plan,
+                ticket,
+                &cfg,
+                planned_budget,
+                &resp.action,
+                require_non_discard,
+            )
+            .await;
             // A riichi plan that produced an input command has not
             // necessarily declared anything: if the button press was lost
             // and only the tile press landed, the client sends a plain
@@ -839,25 +902,6 @@ impl AutoplayManager {
         current.map(|b| b.opened_at) == Some(planned.opened_at)
     }
 
-    /// Reload the game tab. The bridge reconnects into the in-progress
-    /// hand through its `GameRestore` path (`syncGame` replay), so the
-    /// cost is a reconnect rather than the game.
-    async fn reload_page(&mut self) {
-        let page_guard = self.ctx.page.read().await;
-        let Some(page) = page_guard.as_ref().cloned() else {
-            warn!("autoplay: cannot reload — no page handle");
-            return;
-        };
-        drop(page_guard);
-        if let Err(e) = page.reload().await {
-            warn!("autoplay: page reload failed: {e:#}");
-        }
-        // The canvas is rebuilt on reload; drop the cached rect so the
-        // next click re-measures it.
-        self.state.canvas_rect_at = None;
-        *self.ctx.canvas_rect.write().await = None;
-    }
-
     fn handle_mjai_event(&mut self, ev: &MjaiEvent) {
         match ev {
             MjaiEvent::StartGame { id, .. } => {
@@ -878,20 +922,15 @@ impl AutoplayManager {
                 // push_random_pre_delay uses the max delay (opening-hand guard).
                 let canvas_at = self.state.canvas_rect_at;
                 let cached_seat = self.state.cached_our_seat;
-                // The dead-click count survives too: a client that has
-                // stopped accepting presses stays that way across the kyoku
-                // boundary, and zeroing it here would need the failures to
-                // land inside one hand before anything recovered them.
-                let dead_clicks = self.state.dead_clicks;
                 self.state = ManagerState::default();
                 self.state.canvas_rect_at = canvas_at;
                 self.state.cached_our_seat = cached_seat;
-                self.state.dead_clicks = dead_clicks;
             }
             MjaiEvent::Tsumo { actor, pai } => {
                 if let Some(seat) = self.our_seat_cached() {
                     if *actor == seat {
                         self.state.last_self_tsumo = Some(pai.clone());
+                        self.own_tsumo_seq += 1;
                     }
                 }
             }
@@ -1007,10 +1046,261 @@ fn retry_hold_ms(base: u32, attempt: u32) -> u32 {
     base.saturating_mul(attempt + 2).min(2_000)
 }
 
+/// Fixed grace between sighting the end-screen OK button and starting the
+/// randomized inter-game delay.
+const POST_OK_GRACE: Duration = Duration::from_secs(10);
+
+/// How long the galaxy queue may run empty before the sun fallback is
+/// added (matching the client's "find a sun table" 2-minute timer).
+const GALAXY_FALLBACK_AFTER: Duration = Duration::from_secs(120);
+
+/// How long a queue attempt waits for a table before the session gives
+/// up (finding one in the higher rooms routinely takes minutes).
+const QUEUE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Queue the first match of a session immediately — called from the
+/// session-start IPC when no game is in progress.
+pub fn spawn_queue_task(
+    cfg: Arc<RwLock<AppConfig>>,
+    inject: crate::autoplay::inject::SharedInjectBus,
+    session: crate::autoplay::session::SharedAutoplaySession,
+    notify: NotifyBus,
+    config_dir: std::path::PathBuf,
+) {
+    tauri::async_runtime::spawn(async move {
+        run_queue_task(cfg, inject, session, notify, config_dir).await;
+    });
+}
+
+async fn run_queue_task(
+    cfg: Arc<RwLock<AppConfig>>,
+    inject: crate::autoplay::inject::SharedInjectBus,
+    session: crate::autoplay::session::SharedAutoplaySession,
+    notify: NotifyBus,
+    config_dir: std::path::PathBuf,
+) {
+    if let Err(reason) = queue_match(&cfg, &inject, &session, &notify, &config_dir).await {
+        session.stop(&reason);
+        warn!("autoplay session: {reason}");
+        let _ = notify
+            .send(crate::schema::Notification::error("Autoplay session stopped").body(reason));
+    }
+}
+
+/// Book one ranked match over the lobby HTTP API and wait for the table.
+/// One attempt: on timeout the queues are left and the session stops. An
+/// `Err` stops the session with that reason; `Ok(())` means a match
+/// started (or the session was already over).
+async fn queue_match(
+    cfg: &Arc<RwLock<AppConfig>>,
+    inject: &crate::autoplay::inject::SharedInjectBus,
+    session: &crate::autoplay::session::SharedAutoplaySession,
+    notify: &NotifyBus,
+    config_dir: &std::path::Path,
+) -> Result<(), String> {
+    use crate::bridge::riichi_city::lobby;
+
+    if !session.is_active() {
+        return Ok(());
+    }
+    let rc = cfg.read().await.autoplay.riichi_city.clone();
+    let deviceid = lobby::load_or_create_device_id(config_dir)
+        .map_err(|e| format!("could not persist the lobby device id: {e:#}"))?;
+    let creds = inject.lobby_credentials().ok_or_else(|| {
+        "not connected — log into Riichi City with capture running first".to_string()
+    })?;
+    let client = lobby::LobbyClient::new(
+        rc.queue_web_base
+            .as_deref()
+            .unwrap_or(lobby::DEFAULT_WEB_BASE),
+        lobby::LobbyAuth::from_credentials(&creds, deviceid, rc.channel.clone()),
+    );
+    let classifies = client
+        .read_classifies()
+        .await
+        .map_err(|e| format!("could not read the ranked-room list: {e:#}"))?;
+    let fallback_classify = if rc.room == crate::config::RiichiRoom::Galaxy
+        && rc.galaxy_fallback_sun
+    {
+        lobby::select_classify(&classifies, crate::config::RiichiRoom::Sun, rc.game_type).cloned()
+    } else {
+        None
+    };
+
+    // The generation snapshot is the "a match started" signal: the
+    // StartGame handler bumps it when the booked table actually opens.
+    let generation = session.start_generation();
+    let classify = lobby::select_classify(&classifies, rc.room, rc.game_type)
+        .ok_or_else(|| "the configured room / game length is not offered right now".to_string())?;
+    let env = client
+        .start_stage(&classify.id)
+        .await
+        .map_err(|e| format!("the queue request failed: {e:#}"))?;
+    if env.code != 0 {
+        // Never retried: the interesting refusals (identity challenge,
+        // AI-ban notice, AFK penalty) all mean a human must act.
+        return Err(format!(
+            "queueing was refused: {}",
+            lobby::start_stage_failure_reason(env.code)
+        ));
+    }
+    info!("autoplay session: queued a match");
+    session.note_queuing();
+    let _ = notify.send(
+        crate::schema::Notification::info("Autoplay session")
+            .body("Queued for a match — waiting for a table."),
+    );
+    let queued_at = Instant::now();
+    let deadline = queued_at + QUEUE_TIMEOUT;
+    let mut fell_back = false;
+    loop {
+        if session.start_generation() != generation {
+            session.clear_queue_wait();
+            let _ = notify.send(
+                crate::schema::Notification::info("Autoplay session")
+                    .body("Match found — a new game is starting."),
+            );
+            return Ok(()); // matched — the new game drives itself
+        }
+        if !session.is_active() {
+            session.clear_queue_wait();
+            leave_queue(&client, inject).await;
+            return Ok(());
+        }
+        if !fell_back {
+            if let Some(sun) = &fallback_classify {
+                if queued_at.elapsed() >= GALAXY_FALLBACK_AFTER {
+                    // Additive like the client: sun is booked alongside
+                    // galaxy — whichever table forms first wins. One
+                    // attempt; a refused add leaves the galaxy queue
+                    // running.
+                    info!(
+                        "autoplay session: no galaxy table in {}s — \
+                         also queueing sun",
+                        GALAXY_FALLBACK_AFTER.as_secs()
+                    );
+                    fell_back = true;
+                    match client.start_stage(&sun.id).await {
+                        Ok(env) if env.code == 0 => {
+                            let _ = notify.send(
+                                crate::schema::Notification::info("Autoplay session")
+                                    .body("No galaxy table in 2 minutes — now also queueing sun."),
+                            );
+                        }
+                        Ok(env) => warn!(
+                            "autoplay session: sun queue add refused (code {}) — \
+                             staying in the galaxy queue",
+                            env.code
+                        ),
+                        Err(e) => warn!(
+                            "autoplay session: sun queue add failed: {e:#} — \
+                             staying in the galaxy queue"
+                        ),
+                    }
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+    }
+    warn!(
+        "autoplay session: no game within {}s — stopping",
+        QUEUE_TIMEOUT.as_secs()
+    );
+    session.clear_queue_wait();
+    leave_queue(&client, inject).await;
+    Err(format!(
+        "no match was found within {} minutes — session stopped",
+        QUEUE_TIMEOUT.as_secs() / 60
+    ))
+}
+
+/// Cancel every live queue (each by its own matchID; the fallback runs
+/// two at once).
+async fn leave_queue(
+    client: &crate::bridge::riichi_city::lobby::LobbyClient,
+    inject: &crate::autoplay::inject::SharedInjectBus,
+) {
+    for (_, match_id) in inject.queue_states() {
+        match client.cancel_stage(&match_id).await {
+            Ok(env) if env.code == 0 => info!("autoplay session: left a queue"),
+            Ok(env) => warn!(
+                "autoplay session: leaving a queue was refused (code {})",
+                env.code
+            ),
+            Err(e) => warn!("autoplay session: leaving a queue failed: {e:#}"),
+        }
+    }
+    inject.clear_queue_state();
+}
+
+/// Wait until the end screens are actually up (first OK-button sighting),
+/// polling once a second. Returns `false` when the session stopped or a
+/// new game already started (nothing left to wait for); `true` when the
+/// button was sighted — or the cap elapsed without one (the user may have
+/// clicked through fast, or the window is hidden), in which case the
+/// caller proceeds with the plain delay.
+async fn wait_for_ok_button(
+    session: &crate::autoplay::session::SharedAutoplaySession,
+    generation: u64,
+) -> bool {
+    /// The breakdown OK renders within a few seconds of `room_end`.
+    const SIGHTING_CAP: Duration = Duration::from_secs(30);
+    const POLL: Duration = Duration::from_secs(1);
+
+    let deadline = tokio::time::Instant::now() + SIGHTING_CAP;
+    loop {
+        if !session.is_active() || session.start_generation() != generation {
+            return false;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            debug!("autoplay session: no OK sighting before the cap — proceeding");
+            return true;
+        }
+        let sighted = tauri::async_runtime::spawn_blocking(
+            crate::autoplay::riichi_city::vision::capture_ok_button,
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+        if sighted {
+            return true;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// How long an action planned with no window open may wait for its window.
 /// Own-turn actions trail the deal animation by seconds; claim offers
 /// trail their discard broadcast by milliseconds, so a tight bound keeps
 /// a timed-out claim from ever landing in the next window.
+/// The visible think time to hold before sending, in ms: the humanizer's
+/// target (`sleep_ms`, already clamped by the delay model), floored so
+/// the turn timer is visibly up before the send, capped at 10s — and
+/// never past the server's remaining turn budget. After a reconnect the
+/// offer comes back with the variable time burned to zero (the timer
+/// ticks through the dead period), leaving as little as the 5s fixed
+/// part for the whole claim-then-discard cycle; a full 2s think beat the
+/// client's expiry auto-discard by 82ms in the live capture this guards.
+/// The budget keeps 1.5s for the send round-trip and never shrinks the
+/// beat below 500ms — a nearly-dead timer still gets a visible pause,
+/// not an instant send.
+fn think_target_ms(sleep_ms: u64, turn_budget_ms: Option<u32>) -> u64 {
+    const MIN_VISIBLE_THINK_MS: u64 = 2_000;
+    const THINK_CAP_MS: u64 = 10_000;
+    const SEND_MARGIN_MS: u64 = 1_500;
+    const MIN_BEAT_MS: u64 = 500;
+    let budget_ms = turn_budget_ms
+        .map(|b| (b as u64).saturating_sub(SEND_MARGIN_MS).max(MIN_BEAT_MS))
+        .unwrap_or(THINK_CAP_MS);
+    sleep_ms
+        .clamp(MIN_VISIBLE_THINK_MS, THINK_CAP_MS)
+        .min(budget_ms)
+}
+
 fn future_window_grace(action: &MjaiEvent) -> Duration {
     match action {
         MjaiEvent::Dahai { .. }
@@ -1100,9 +1390,7 @@ async fn execute_riichi_frame(
     // opening discard human-paced: the deal animation precedes the window
     // and must not eat the think. Capped well under the ~15s window;
     // floored so the timer is always visibly up before the send.
-    const MIN_VISIBLE_THINK_MS: u64 = 2_000;
-    const THINK_CAP_MS: u64 = 10_000;
-    let target_ms = sleep_ms.clamp(MIN_VISIBLE_THINK_MS, THINK_CAP_MS);
+    let target_ms = think_target_ms(sleep_ms, inject.turn_budget_ms());
     let elapsed_ms = identity.elapsed().as_millis() as u64;
     if elapsed_ms < target_ms {
         tokio::time::sleep(Duration::from_millis(target_ms - elapsed_ms)).await;
@@ -1216,7 +1504,6 @@ mod tests {
             aka_flag: None,
             id: Some(1),
             num_players: 4,
-            game_meta: None,
         });
         assert_eq!(
             m.state.cached_our_seat,
@@ -1248,7 +1535,6 @@ mod tests {
             aka_flag: None,
             id: Some(2),
             num_players: 4,
-            game_meta: None,
         });
         assert_eq!(m.state.cached_our_seat, Some(2));
 
@@ -1275,29 +1561,6 @@ mod tests {
             Some(2),
             "seat must survive EndKyoku reset"
         );
-    }
-
-    /// A client that has stopped accepting presses stays that way across
-    /// a kyoku boundary — the failures run to the end of the game — so the
-    /// count has to survive one, or the threshold would only ever be
-    /// reached by failures packed into a single hand. It does reset for a
-    /// new game, which is a new page state.
-    #[test]
-    fn dead_click_count_survives_a_kyoku_but_not_a_game() {
-        let mut m = make_manager();
-        m.state.dead_clicks = 2;
-        m.handle_mjai_event(&MjaiEvent::EndKyoku);
-        assert_eq!(m.state.dead_clicks, 2, "the client is still not listening");
-
-        m.handle_mjai_event(&MjaiEvent::StartGame {
-            names: vec!["a".into(), "b".into(), "c".into(), "d".into()],
-            kyoku_first: None,
-            aka_flag: None,
-            id: Some(0),
-            num_players: 4,
-            game_meta: None,
-        });
-        assert_eq!(m.state.dead_clicks, 0, "a new table is a fresh start");
     }
 
     /// A single-click plan (most of them: discard, pon, ron, skip) has
@@ -1366,6 +1629,37 @@ mod tests {
             pai: Some("2m".into()),
         };
         assert!(!discard_needs_window_guard(&reach));
+    }
+
+    /// The think target yields to the server's remaining turn budget.
+    /// Regression for the live 2026-08-27 capture: after a reconnect the
+    /// offer carried `oper_fixed_time: 5, oper_var_time: 0` and a full
+    /// 2s think beat the client's expiry auto-discard by 82ms — luck,
+    /// not design. With a 5s budget the send now lands at 3.5s (5s −
+    /// 1.5s round-trip margin); a healthy 25s budget keeps the humanized
+    /// think; an unknown budget keeps the old behavior.
+    #[test]
+    fn think_target_yield_to_a_burned_turn_budget() {
+        // Post-reconnect: fixed 5s only. 2s humanizer floor would race
+        // the timer; the budget caps it to 3.5s... which is still above
+        // the floor, so the floor applies — the cap binds when the
+        // budget drops below floor + margin.
+        assert_eq!(think_target_ms(2_000, Some(5_000)), 2_000);
+        // 4s budget: 4s − 1.5s = 2.5s still above the 2s floor.
+        assert_eq!(think_target_ms(2_000, Some(4_000)), 2_000);
+        // 3s budget: 3s − 1.5s = 1.5s — now the cap binds under the floor.
+        assert_eq!(think_target_ms(2_000, Some(3_000)), 1_500);
+        // A long humanizer think on a burned budget.
+        assert_eq!(think_target_ms(8_000, Some(5_000)), 3_500);
+        // Nearly dead: the 500ms visible-beat floor.
+        assert_eq!(think_target_ms(8_000, Some(1_500)), 500);
+        assert_eq!(think_target_ms(8_000, Some(100)), 500);
+        // Healthy budget: the humanizer's number stands, capped at 10s.
+        assert_eq!(think_target_ms(3_456, Some(25_000)), 3_456);
+        assert_eq!(think_target_ms(60_000, Some(25_000)), 10_000);
+        // Unknown budget (pre-offer / other flows): the old behavior.
+        assert_eq!(think_target_ms(2_000, None), 2_000);
+        assert_eq!(think_target_ms(60_000, None), 10_000);
     }
 
     /// Own-turn actions wait out the deal animation (long grace); claim
@@ -1452,7 +1746,6 @@ mod tests {
             aka_flag: None,
             id: Some(0),
             num_players: 4,
-            game_meta: None,
         });
         assert_eq!(m.state.cached_our_seat, Some(0));
 
@@ -1463,7 +1756,6 @@ mod tests {
             aka_flag: None,
             id: None,
             num_players: 4,
-            game_meta: None,
         });
         assert!(
             m.state.cached_our_seat.is_none(),

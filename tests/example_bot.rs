@@ -91,7 +91,6 @@ fn start_game(seat: u8) -> MjaiEvent {
         aka_flag: Some(true),
         id: Some(seat),
         num_players: 4,
-        game_meta: None,
     }
 }
 

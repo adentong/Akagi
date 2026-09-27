@@ -91,7 +91,7 @@ Quick start
      Linux/macOS:  ./akagi
      Windows:      akagi.exe
 3. On first launch, Akagi creates these directories alongside the binary:
-     config.toml   logs/   history/   ca/   mjai_bot/
+     config.toml   logs/   ca/   mjai_bot/
 
 Platform notes
 --------------

@@ -1,4 +1,3 @@
-pub mod analysis;
 pub mod autoplay;
 pub mod bot;
 pub mod bridge;
@@ -8,7 +7,6 @@ pub mod config;
 pub mod event_bus;
 pub mod game_state;
 pub mod github;
-pub mod history;
 pub mod inspector;
 pub mod ipc;
 pub mod logger;
@@ -19,7 +17,6 @@ pub mod updater;
 pub mod util;
 
 use clap::Parser;
-use std::path::Path;
 use std::sync::Arc;
 use tauri::Manager;
 use tracing::{error, info, warn};
@@ -87,26 +84,7 @@ pub fn run() {
     let bot_status_bus = event_bus::bot_status_bus();
     let capture_status_bus = event_bus::capture_status_bus();
     let notify_bus = event_bus::notify_bus();
-    let analysis_bus = event_bus::analysis_bus();
     let post_tracker_bus = event_bus::post_tracker_bus();
-    let history_bus = event_bus::history_bus();
-
-    // Persistent game-history store. Lives under `<config_root>/history/`
-    // by default — independent of the volatile session log dir. Failure
-    // to create the dir is fatal: the recorder task and IPC commands
-    // both depend on it.
-    let history_root = util::resolve_dir(Path::new("./history"));
-    let history_store = match history::HistoryStore::new(history_root.clone()) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            error!(
-                "Failed to initialise history store at {}: {e:#}",
-                history_root.display()
-            );
-            return;
-        }
-    };
-    info!("History store at {}", history_root.display());
 
     let bot_enabled = cfg.bot.enabled;
     let proxy_enabled = cfg.proxy.enabled;
@@ -117,23 +95,17 @@ pub fn run() {
     // the Arc, but the consumer task is spawned inside `.setup()` once
     // the Tauri Tokio runtime is live (sync `lib::run` has no runtime).
     let game_tracker = game_state::tracker::new_handle();
-    let analysis_cache = std::sync::Arc::new(tokio::sync::RwLock::new(None));
 
     let tracker_rx = mjai_bus.subscribe();
     let tracker_post = post_tracker_bus.clone();
-    let analysis_rx = post_tracker_bus.subscribe();
-    let analysis_tracker = game_tracker.clone();
-    let analysis_bus_for_runner = analysis_bus.clone();
-    let analysis_cache_for_runner = analysis_cache.clone();
-
-    let history_rx = mjai_bus.subscribe();
-    let history_store_for_recorder = history_store.clone();
-    let history_bus_for_recorder = history_bus.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
+                // The main window is fixed at 800x600; restore only where it
+                // was, never a size saved by an older resizable build.
+                .with_state_flags(tauri_plugin_window_state::StateFlags::POSITION)
                 // The overlay's geometry is still saved and restored, but not
                 // by the plugin's automatic pass: that restores `StateFlags::all()`,
                 // which would put decorations back on a deliberately frameless
@@ -162,9 +134,6 @@ pub fn run() {
                     ),
                 }
 
-                let history_platform =
-                    history::recorder::shared_platform(schema::Platform::from(cfg.platform.kind));
-
                 let state = ipc::AppState::new(
                     cfg,
                     config_path,
@@ -175,12 +144,7 @@ pub fn run() {
                     bot_status_bus.clone(),
                     capture_status_bus.clone(),
                     notify_bus.clone(),
-                    analysis_bus.clone(),
-                    history_bus.clone(),
                     game_tracker,
-                    analysis_cache,
-                    history_store.clone(),
-                    history_platform.clone(),
                     runtime.clone(),
                 );
 
@@ -216,30 +180,12 @@ pub fn run() {
                     });
                 }
 
-                // Spawn tracker + analysis loops inside the Tauri Tokio
-                // runtime — `lib::run` itself is sync.
+                // Spawn the tracker loop inside the Tauri Tokio runtime —
+                // `lib::run` itself is sync.
                 tauri::async_runtime::spawn(game_state::tracker::drive_loop(
                     state.game_tracker.clone(),
                     tracker_rx,
                     Some(tracker_post),
-                ));
-                tauri::async_runtime::spawn(analysis::runner::drive_loop(
-                    analysis_rx,
-                    analysis_tracker,
-                    analysis_bus_for_runner,
-                    analysis_cache_for_runner,
-                ));
-
-                // History recorder. Subscribes to the shared MjaiBus and
-                // finalises one GameRecord per `EndGame`. The platform tag
-                // is taken from the active bridge selection at startup;
-                // changing platform at runtime requires a relaunch for the
-                // history records to pick up the new tag.
-                tauri::async_runtime::spawn(history::recorder::drive_loop(
-                    history_store_for_recorder,
-                    history_bus_for_recorder,
-                    history_platform.clone(),
-                    history_rx,
                 ));
 
                 if bot_enabled {

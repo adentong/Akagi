@@ -33,14 +33,14 @@ via `tauri::State<AppState>`) and spawns one forwarder task per bus.
 | `mjai-event`    | `schema::MjaiEvent`                | proxy bridge → `event_bus::MjaiBus` |
 | `bot-response`  | `bot::BotResponse`                 | `BotManager` → `BotResponseBus`    |
 | `bot-status`    | `schema::BotStatus`                | `BotManager` → `BotStatusBus`      |
-| `proxy-status`  | `schema::ProxyStatus`              | `proxy_supervisor` → `ProxyStatusBus` |
+| `capture-status`| `schema::CaptureStatus`            | capture supervisor → `CaptureStatusBus` |
 | `notify`        | `schema::Notification`             | any subsystem → `NotifyBus`        |
 | `overlay-config`| `config::OverlayConfig`            | `overlay::reconcile` → every webview |
 
 Every event above is broadcast to **all** webviews, not just the main one.
 That is what lets the overlay window (see below) render suggestions off
 `bot-response` without any plumbing of its own — and what lets the main
-window's Game-page toggle stay in sync with an overlay that was closed from
+window's Overview toggle stay in sync with an overlay that was closed from
 its own × button.
 
 Frontend subscribes once at app start:
@@ -58,22 +58,63 @@ without waiting for the next event.
 
 ## Commands callable from the frontend
 
+Config / overlay:
+
 | Command          | Args                  | Returns                  | Notes                        |
 |------------------|-----------------------|--------------------------|------------------------------|
 | `get_config`     | —                     | `AppConfig`              | Live read of in-memory config|
-| `update_config`  | `new_config`          | `()`                     | Persists to TOML; subsystems do **not** auto-restart. Does reconcile the overlay window against `overlay.*` |
+| `update_config`  | `new_config`          | `()`                     | Persists to TOML; capture-relevant changes restart capture, overlay changes reconcile the overlay window |
 | `set_overlay_enabled` | `enabled`        | `()`                     | Flips + persists `overlay.enabled` and opens/closes the window. Exists so the overlay's own close button doesn't have to round-trip a whole `AppConfig` |
+| `open_external_url` | `url`              | `()`                     | Opens an `http(s)` URL in the default browser (scheme-validated) |
+
+Bots:
+
+| Command          | Args                  | Returns                  | Notes                        |
+|------------------|-----------------------|--------------------------|------------------------------|
 | `list_bots`      | —                     | `Vec<BotInfo>`           | Re-scans `cfg.bot.dir`       |
 | `set_active_bot` | `mode, name`          | `()`                     | Updates + persists `bot.active_4p` or `bot.active_3p` (`mode` ∈ `"4p"` / `"3p"`); empty `name` clears the slot |
+| `get_bot_settings` | `name`              | `BotSettings`            | Manifest schema + current values |
+| `update_bot_settings` | `name, values`   | `()`                     | Validate against manifest + persist to the bot's `settings.toml` |
 | `install_bot_from_github` | `repo, asset_glob?, name?` | `BotInfo`     | Download + extract; runs `uv sync` post-install if a runtime is available |
 | `install_bot_from_zip` | `zip_path, name?`     | `BotInfo`                | Install from a local `.zip` (same extract/validate/`uv sync` pipeline as the GitHub install, minus the download). `name` defaults to the zip file stem; the source zip is never deleted |
-| `update_bot_from_manifest` | `name`            | `BotInfo`                | Reinstall from the source declared in the bot's `manifest.toml` |
 | `sync_bot_deps`  | `name, force`         | `()`                     | Re-runs `uv sync` for an installed bot. `force=true` wipes `.akagi/synced.stamp` and `.akagi/venv/` first (used by the per-bot Reinstall environment button). Per-bot `SyncGuard` rejects concurrent calls. |
 | `delete_bot`     | `name`                | `()`                     | Refuses if the bot is the active 4p/3p; refuses paths that escape `bot.dir` |
-| `start_proxy`    | —                     | `()` / `Err("…running")` | Spawns supervisor; idempotent guard |
-| `stop_proxy`     | —                     | `()`                     | Sends shutdown to current proxy task |
-| `get_status`     | —                     | `Snapshot`               | One-shot dump (config, bot_status, proxy_status, log_dir) |
-| `get_log_dir`    | —                     | `PathBuf`                | Current log session directory|
+
+Capture:
+
+| Command          | Args                  | Returns                  | Notes                        |
+|------------------|-----------------------|--------------------------|------------------------------|
+| `start_capture`  | —                     | `()`                     | Spawns the configured capture backend; idempotent guard |
+| `stop_capture`   | —                     | `()`                     | Sends shutdown to the current capture task |
+| `restart_capture`| —                     | `()`                     | Stop + start |
+| `detect_system_chrome` | —               | `Vec<DetectedBrowser>`   | Chromium-family browser scan |
+| `list_cft_installed` | —                  | `Vec<String>`            | Chrome for Testing versions on disk |
+| `download_chrome_for_testing` | `channel` | `()`                | Download + unpack CfT |
+| `remove_chrome_for_testing` | `channel` | `()`                  | Delete a CfT install |
+
+Autoplay (Riichi City full-auto sessions):
+
+| Command          | Args                  | Returns                  | Notes                        |
+|------------------|-----------------------|--------------------------|------------------------------|
+| `autoplay_session_start` | `games?`      | session status           | Save the queue options + start the session |
+| `autoplay_session_stop` | —              | session status           | Stop the running session |
+| `autoplay_session_status` | —            | session status           | Polled by the FullAutoDialog |
+| `riichi_city_available_rooms` | —        | `{ rooms: string[] }`    | Rank-gated room list from the lobby API |
+
+Status / updates / cloud API:
+
+| Command          | Args                  | Returns                  | Notes                        |
+|------------------|-----------------------|--------------------------|------------------------------|
+| `get_status`     | —                     | `Snapshot`               | One-shot dump (config, bot_status, capture_status, log_dir) |
+| `check_for_update` | —                   | `UpdateInfo \| null`     | Cached release check |
+| `apply_update`   | —                     | `()`                     | Download + swap the binary in place |
+| `native_api_redeem` | `base_url, key?…`  | `RedeemResponse`         | Redeem a prepaid code |
+| `native_api_key_status` | `base_url, key, proxy?` | `KeyStatus`       | `GET /v3/key` |
+| `native_api_models` | `base_url, key, proxy?` | `Vec<ModelInfo>` | `GET /v3/models` |
+| `native_api_health` | `base_url, proxy?` | `ApiHealth`             | `GET /healthz` |
+| `native_api_create_order` / `native_api_order_result` | order args / `id` | order state | PayPal one-time purchase |
+| `native_api_create_subscription` / `native_api_subscription_result` | subscription args / `id` | subscription state | PayPal subscription |
+| `native_api_create_checkout` / `native_api_checkout_result` | checkout args / `id` | checkout state | Creem checkout |
 
 Errors are returned as `String` so the frontend can put them straight
 into a toast.
@@ -104,15 +145,17 @@ Four things are worth knowing before touching it:
   overlay webview silently loses permission to `listen()`, i.e. renders blank
   forever with no error.
 - **`tauri-plugin-window-state` must skip it.** The plugin's automatic restore
-  applies `StateFlags::all()`, which includes `DECORATIONS` — it would put a
-  title bar back onto a deliberately frameless window. `lib.rs` therefore
-  registers the plugin with `.skip_initial_state(ipc::overlay::LABEL)` and
-  `overlay::open` restores position + size itself.
+  applies the configured flags, which include `DECORATIONS` for the default
+  `StateFlags::all()` — it would put a title bar back onto a deliberately
+  frameless window. `lib.rs` registers the plugin with position-only state
+  (`.with_state_flags(StateFlags::POSITION)`) plus
+  `.skip_initial_state(ipc::overlay::LABEL)`, and `overlay::open` restores
+  position + size itself.
 
 Lifecycle is driven entirely by `config.overlay.enabled` (default: **on**)
 through `overlay::reconcile`, which is idempotent and called from three places:
 app startup, `update_config`, and `set_overlay_enabled`. The last is what the
-Game page's toolbar toggle and the overlay's own × button both call.
+Overview tab's toggle and the overlay's own × button both call.
 
 **The overlay must never outlive the app.** Tauri exits when *all* windows
 close, and the overlay counts as one — so `lib.rs` hooks the main window's

@@ -15,9 +15,11 @@ Structured text + binary logging built on [`tracing`](https://crates.io/crates/t
 
 ```
 <log_root>/<YYYYMMDD-HHMMSS>/
-├── all.log              # every event from every target
+├── all.log              # every event from every target (text)
+├── all.jsonl            # the same stream, one JSON object per line
 ├── proxy.log            # one file per LogTarget (filtered by tracing target prefix)
 ├── proxy.binlog         # binary frames written via BinaryLogger
+├── inspector.jsonl      # frames / mjai events / bot reactions / HTTP exchanges
 ├── majsoul/             # one subdir per platform (FlowLogger)
 │   ├── 000001-gateway.log                # one file per WS flow: <id:06>-<uri-slug>.log
 │   ├── 000002-game-gateway.log
@@ -31,7 +33,7 @@ Structured text + binary logging built on [`tracing`](https://crates.io/crates/t
 
 Each line carries: timestamp, level, tracing target, source `file:line`, message. ANSI colour is stripped in files. Console (stderr) keeps colour.
 
-File outputs (`all.log`, per-target `*.log`) use a custom `CompactNoSpans` formatter that **omits the parent-span list**. Third-party crates (e.g. `hudsucker`) wrap our handlers in nested `#[instrument]` spans whose rendered prefix is longer than the actual event — the file format drops them. Console keeps the default `Full` formatter so span context stays visible interactively.
+File outputs (`all.log`, per-target `*.log`) use a custom `CompactNoSpans` formatter that **omits the parent-span list**. (`all.jsonl` is JSON, one `schema::LogEntry` per line, written by the stream layer.) Third-party crates (e.g. `hudsucker`) wrap our handlers in nested `#[instrument]` spans whose rendered prefix is longer than the actual event — the file format drops them. Console keeps the default `Full` formatter so span context stays visible interactively.
 
 The console layer uses `EnvFilter` honouring `RUST_LOG`; if unset, falls back to `default_level` (from `[logging] level`). The combined `all.log` is severity-filtered by `all_level` (from `[logging] all_level`, same `EnvFilter` syntax — e.g. `"info"` or `"akagi=debug,hyper=warn"`) so you can suppress trace/debug noise. Per-target files always capture every event so you can grep historic runs without re-running.
 
@@ -42,11 +44,11 @@ In `lib.rs::run`, append a `LogTarget` to the slice passed to `logger::init`:
 ```rust
 &[
     logger::LogTarget::new("proxy", "akagi::proxy"),
-    logger::LogTarget::new("ai",    "akagi::ai"),
+    logger::LogTarget::new("bot",   "akagi::bot"),
 ]
 ```
 
-`prefix` is matched against each event's tracing target (longest-prefix). Module path is the default target, so any `tracing::info!` inside `src/ai/` lands in `ai.log`.
+`prefix` is matched against each event's tracing target (longest-prefix). Module path is the default target, so any `tracing::info!` inside `src/bot/` lands in `bot.log`.
 
 ## Binary logging
 

@@ -11,6 +11,69 @@ pub struct AutoplayConfig {
     pub majsoul: MajsoulAutoplayConfig,
     /// Pre-click delay model (platform-agnostic). See `autoplay::delay`.
     pub delay: DelayModelConfig,
+    /// Riichi City autoplay (frame injection through the MITM proxy) plus
+    /// the auto-queue session knobs. Reuses `majsoul`'s timings and the
+    /// shared delay model for the per-decision think time.
+    pub riichi_city: RiichiCityAutoplayConfig,
+}
+
+/// Riichi City ranked rooms, lowest to highest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RiichiRoom {
+    Star,
+    Moon,
+    Sun,
+    #[default]
+    Galaxy,
+}
+
+/// Riichi City ranked game lengths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RiichiGameType {
+    /// East-only (tonpuusen).
+    #[default]
+    EastOnly,
+    /// Hanchan (full game, east + south).
+    Hanchan,
+}
+
+/// Riichi City autoplay session parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RiichiCityAutoplayConfig {
+    /// Room to queue ranked matches in.
+    pub room: RiichiRoom,
+    /// Game length to queue.
+    pub game_type: RiichiGameType,
+    /// Galaxy only: accept a Sun table if none is found within 2 minutes.
+    /// Ignored (and hidden in the UI) for the other rooms.
+    pub galaxy_fallback_sun: bool,
+    /// Wait after a game ends before queueing the next one, ms. The actual
+    /// wait is uniform in `[inter_game_delay_ms, 3/2 × inter_game_delay_ms]`,
+    /// after a fixed 10s post-score-screen grace.
+    pub inter_game_delay_ms: u32,
+    /// Lobby API base URL. `None` uses the node the client itself races
+    /// to by default (`aga-alb.mahjong-jp.net`). Debug knob for when the
+    /// server fleet moves — not exposed in the UI.
+    pub queue_web_base: Option<String>,
+    /// Distribution channel sent in the lobby `Cookies` header
+    /// (the Steam client identifies as `steam`). Debug knob.
+    pub channel: String,
+}
+
+impl Default for RiichiCityAutoplayConfig {
+    fn default() -> Self {
+        Self {
+            room: RiichiRoom::default(),
+            game_type: RiichiGameType::default(),
+            galaxy_fallback_sun: false,
+            inter_game_delay_ms: 8_000,
+            queue_web_base: None,
+            channel: "steam".to_string(),
+        }
+    }
 }
 
 /// Which delay policy drives autoplay. Exactly one is active.
@@ -194,17 +257,6 @@ pub struct MajsoulAutoplayConfig {
     /// logs). Each retry re-checks that the decision window is still the
     /// one the plan was made for.
     pub click_retries: u32,
-    /// Reload the game page after this many decisions in a row where the
-    /// client accepted no input at all. `0` disables it.
-    ///
-    /// The client can end up in a state where presses on the action
-    /// buttons stop registering and stay that way for the rest of the
-    /// game — once it starts it does not recover on its own, and every
-    /// remaining decision runs to timeout. A reload reconnects into the
-    /// hand through the bridge's `GameRestore` path, so the cost is a
-    /// reconnect rather than the game. Deliberately not 1: a single lost
-    /// press is common enough and costs only that decision.
-    pub reload_after_failures: u32,
     /// Extra delay tacked onto the dealer's first discard. Mahjong Soul
     /// plays a hand-sort animation when the dealer receives all 14 tiles
     /// at once; clicks issued during the animation are dropped. ~2s
@@ -224,7 +276,6 @@ impl Default for MajsoulAutoplayConfig {
             click_hold_ms: 100,
             verify_input_ms: 300,
             click_retries: 2,
-            reload_after_failures: 3,
             dealer_first_discard_extra_delay_ms: 2000,
         }
     }

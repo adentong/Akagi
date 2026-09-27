@@ -755,7 +755,6 @@ mod tests {
             click_hold_ms: 0,
             verify_input_ms: 0,
             click_retries: 0,
-            reload_after_failures: 0,
             dealer_first_discard_extra_delay_ms: 0,
         }
     }

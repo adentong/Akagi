@@ -54,12 +54,6 @@ impl ParseResult {
     pub fn empty() -> Self {
         Self::default()
     }
-    pub fn just_events(events: Vec<MjaiEvent>) -> Self {
-        Self {
-            events,
-            parsed: None,
-        }
-    }
 }
 
 /// Translates raw platform frames to mjai events and vice-versa.
@@ -103,6 +97,7 @@ pub struct BridgeHooks {
 /// Construct a bridge for the given platform.
 ///
 /// - `flow_log`: per-WS-flow text dump (one JSON line per parsed message).
+///   Only the Majsoul bridge records to it; the others ignore it.
 /// - `session`: passed through to bridges that open additional log files
 ///   on demand (e.g. Majsoul rotates a fresh `*.mjai.jsonl` per game).
 /// - `hooks`: autoplay's shared slots — see [`BridgeHooks`].
@@ -119,12 +114,12 @@ pub fn for_platform(
                 .with_input_watch(hooks.input_watch),
         ),
         crate::config::Platform::Tenhou => Box::new(
-            TenhouBridge::new(flow_log, session)
+            TenhouBridge::new(session)
                 .with_shared_state(hooks.tenhou_state)
                 .with_notify(hooks.notify),
         ),
         crate::config::Platform::RiichiCity => {
-            Box::new(RiichiCityBridge::new(flow_log, session).with_inject(hooks.riichi_inject))
+            Box::new(RiichiCityBridge::new(session).with_inject(hooks.riichi_inject))
         }
     }
 }

@@ -2,7 +2,8 @@
 
 Translates Riichi City's WebSocket traffic into the mjai event stream. Native
 client only (no web build), so it is reachable **only through the MITM proxy**;
-the Chromium/CDP capture backend does not apply. **Observe-only** — no autoplay.
+the Chromium/CDP capture backend does not apply. Autoplay is supported by
+injecting the client's own protocol frames (see `autoplay::inject`).
 
 This is a Rust port of the original Akagi v2 Python bridge
 (`mitm/bridge/riichi_city/`). The on-the-wire framing comes from the
@@ -15,6 +16,8 @@ riichishitty reverse-engineering notes.
 | `packet.rs` | `WPacket` framing: 15-byte big-endian header + JSON body decode. |
 | `consts.rs` | `card_to_mjai` — Riichi City tile code → mjai tile string. |
 | `state.rs` | `GameStatus` — per-flow seat / player / pending state. |
+| `build.rs` | mjai action → client frame encoder (autoplay injection). |
+| `lobby.rs` | Lobby HTTP API: queue a match, cancel, room/rank gating. |
 | `mod.rs` | `RiichiCityBridge` — `cmd` dispatch + mjai event building. |
 
 ## Wire format (WPacket)

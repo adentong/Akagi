@@ -1,5 +1,5 @@
-//! Inspector pipeline records — the unified data model for the
-//! Logs → Inspector tab.
+//! Inspector pipeline records — the unified data model for the session's
+//! `inspector.jsonl` timeline.
 //!
 //! One canonical struct per pipeline stage:
 //!
@@ -9,15 +9,11 @@
 //! - `BotReaction` — bot's response with the triggering mjai event and
 //!   reaction latency, so "why did the bot do that?" is answerable from a
 //!   single record.
-//! - `Telemetry` — an analytics beacon the *game client* sent about
-//!   itself, decoded by `crate::telemetry`. Not a pipeline stage: it is
-//!   here because "what did the game report while Akagi was running?" is
-//!   only answerable by putting it on the same timeline as everything
-//!   else.
+//! - `Http` — one captured HTTP exchange (request/response) with any
+//!   recognizer annotations.
 //!
-//! Same shape on the wire (live tail over `tauri::ipc::Channel`) and on
-//! disk (`<session>/inspector.jsonl`). The on-disk file is the source of
-//! truth for past-session viewing; the bus/channel is the live tail.
+//! The on-disk file is the source of truth; read it by hand when debugging
+//! a session.
 
 use super::MjaiEvent;
 use serde::{Deserialize, Serialize};

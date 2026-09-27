@@ -25,7 +25,7 @@ out any deliberate divergence.
 |---|---|---|
 | `<Z/>` | heartbeat | (none) |
 | `HELO` / `REJOIN` / `SAIKAI` / `BYE` / `SHUFFLE` | session control | (none) |
-| `GO` | rules / room, before `TAIKYOKU` | (none; stashed for `MatchInfo`, bit `0x10` = sanma) |
+| `GO` | rules / room, before `TAIKYOKU` | (none; stashed for sanma detection, bit `0x10`) |
 | `UN` | roster, wire-relative names | (none; consumed by `start_game`, an empty slot = sanma) |
 | `TAIKYOKU` | start of game | `start_game` (resolves our seat from `oya`) |
 | `INIT` | start of kyoku | `start_kyoku` (sanma detected via 0-score slot) |
@@ -173,15 +173,15 @@ The bridge therefore:
    the wrong seats), and each `?` draw that lands on our seat renders as 1m;
 4. posts a warning toast (via `BridgeHooks::notify`) and owes a fresh
    `start_game` at the next `<INIT/>`, which reopens the game for the
-   tracker, bots and history on the right seat and player count.
+   tracker and bots on the right seat and player count.
 
 The game's end is the one event that still passes while suspended, so the
-tracker closes the game, the bot manager stops its runner and History resets.
+tracker closes the game and the bot manager stops its runner.
 Whether it arrives during the suspended hand or after play resumed, the
 `end_game` of a game this flow joined mid-way is emitted as *terminated*
 (`MjaiEvent::terminated_game`): the hands before the rejoin were never seen
-here, so History drops the game instead of filing the remainder as a complete
-one with its own per-hand stats. The flag clears at the next `<TAIKYOKU/>`,
+here, so the game is marked incomplete. The flag clears at the next
+`<TAIKYOKU/>`,
 or at an E1H0 `<INIT/>` — the first deal is a game start whether or not a
 `TAIKYOKU` announced it, and it re-seats the flow the same way `TAIKYOKU`
 would.

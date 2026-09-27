@@ -4,22 +4,16 @@
 //! payloads between backend and frontend, persisted records — lives here so
 //! it isn't owned by any single subsystem.
 
-pub mod history;
 pub mod inspector;
 pub mod ipc;
 pub mod mjai;
 
-pub use history::{
-    GameRecord, GameStats, HistoryEvent, HistoryEventLog, HistoryFilter, KyokuMode, MatchInfo,
-    Platform,
-};
 pub use inspector::{
     BotReaction, CaptureSource, FrameDirection, FrameRaw, HttpAnnotation, HttpBody, HttpExchange,
     HttpHeader, HttpPhase, InspectorEntry, ParsedFrame,
 };
 pub use ipc::{
-    BotInfo, BotSettings, BotStatus, CaptureKind, CaptureStatus, HoraScoreInfo, LoadStage,
-    LogEntry, LogSessionInfo, Notification, NotifyLevel, ReadInspectorRequest,
-    ReadInspectorResponse, ReadLogRequest, ReadLogResponse, Snapshot,
+    BotInfo, BotSettings, BotStatus, CaptureKind, CaptureStatus, LoadStage, LogEntry, Notification,
+    NotifyLevel, Snapshot,
 };
-pub use mjai::{GameEndReason, GameMeta, MjaiEvent};
+pub use mjai::{GameEndReason, MjaiEvent};

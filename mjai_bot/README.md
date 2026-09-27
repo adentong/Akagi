@@ -189,14 +189,16 @@ owns its contents. Use it to surface *why* the bot chose its action:
  "meta":{"q_values":[0.12,0.05,0.85],"confidence":0.87}}
 ```
 
-Any keys you put in `meta` are visible in the HUD's bot-responses view as raw
-data, so even ad-hoc fields are useful for debugging.
+Any keys you put in `meta` are forwarded verbatim on the `bot-response`
+event, so even ad-hoc fields are useful for debugging (and for the overlay's
+own rendering rules).
 
 ### `meta.show` — the structured HUD card
 
-For a clean, rendered display, populate **`meta.show`**. Akagi's *Bot Show* HUD
-tile renders the most recent reaction that carries it as a titled list of rows
-(top-N discards, opponent reads, yaku breakdowns — you decide the semantics):
+For a clean, rendered display, populate **`meta.show`**. Akagi's suggestion
+overlay renders the most recent reaction that carries it as a titled list of
+rows (top-N discards, opponent reads, yaku breakdowns — you decide the
+semantics):
 
 ```json
 {"type":"dahai","actor":0,"pai":"1m","tsumogiri":false,
@@ -355,7 +357,7 @@ panel — perfectly fine for a no-knobs bot.
    (A bot with no `pyproject.toml` skips this step entirely.)
 3. **Activate it.** Toggle the bot on for 4-player and/or 3-player games
    (`bot.active_4p` / `bot.active_3p` — the two slots are independent; leave one
-   empty to run that mode analysis-only). You can rebuild the env any time later
+   empty to run that mode without a bot). You can rebuild the env any time later
    via **Configure → Reinstall environment**.
 
 This local-folder flow is the fastest way to iterate while developing. Bots can

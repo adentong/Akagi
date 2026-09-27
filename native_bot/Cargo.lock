@@ -572,7 +572,6 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
- "flate2",
  "rayon",
  "riichienv-core",
  "safetensors 0.6.2",

@@ -51,7 +51,7 @@ bridge to them.
   Spawn point is `start_game` carrying the bot's seat in the `id` field
   and the table's `num_players`. The manager picks `active_4p` or
   `active_3p` from `BotConfig` based on `num_players`; an empty slot for
-  the matching mode means analysis-only for that game (no runner spawned).
+  the matching mode means no runner and no suggestions for that game.
 - `native` — the built-in, in-process bot (no Python, no subprocess).
   Two reserved names select it: `akagi-native` (4p) / `akagi-native3p`
   (3p). `NativeBot` always loads the embedded pure-Rust `native_bot` candle
@@ -74,17 +74,6 @@ bridge to them.
   the client-wide `REQUEST_TIMEOUT`. Building an `ApiClient` builds a fresh
   connection pool, so hold one and reuse it. Consumed by `NativeBot` and by the
   `native_api_*` IPC commands (redeem a code, check a key, list models).
-  Also wraps the whole-game review surface behind the Review page:
-  `submit_review` (gzipped `POST /v3/review`, its own generous
-  `REVIEW_SUBMIT_TIMEOUT` — the server replays the full game at submit),
-  `review_status` (job poll; meta-only — result bodies are served solely
-  through the share URL), `review_share` (issue/re-issue the public link),
-  `shares` (list) and `revoke_share`. Ids interpolated into URL paths are
-  validated to ASCII alphanumerics first. The submit IPC command
-  (`native_api_review_history_game`) loads the recorded history log in Rust
-  and shapes it with `native::build_api_events`, so `/v3/review` sees the
-  identical censored perspective `/v3/react` does and the whole-game log
-  never round-trips through the webview.
 - `purchase` — the unauthenticated payment handshakes used by the in-app "Buy
   key" flow, one per provider. PayPal: `create_order` / `create_subscription`
   return an `approve_url` plus a `claim_secret`, and `order_result` /
@@ -145,8 +134,8 @@ it is in its response phase, including the seats with nothing to claim).
 ## The `meta.show` card (built-in bot)
 
 The built-in bot attaches a `meta.show` card — the ranked candidates with their
-policy probabilities — to its `BotResponse`. The frontend renders it in the Bot
-Show tile and the suggestion overlay. One rule governs it, and everything in
+policy probabilities — to its `BotResponse`. The frontend renders it in the
+suggestion overlay (`BotShowList`). One rule governs it, and everything in
 `native.rs` that touches `meta` exists to keep it true:
 
 > **The card changes exactly when the bot chose something, and never otherwise.**
@@ -310,8 +299,7 @@ const info: BotInfo = await invoke('install_bot_from_github', {
 Behaviour:
 
 - Refuses to overwrite an existing `mjai_bot/<name>/` — the user must
-  remove it first (or call `update_bot_from_manifest` for an explicit
-  reinstall).
+  remove it first.
 - Hits `https://api.github.com/repos/<repo>/releases/latest` anonymously.
   No token support in v1; only public repos.
 - Asset selection: glob (rejecting zero or multiple matches) or first
@@ -337,10 +325,10 @@ Behaviour:
 - Progress is reported through `NotifyBus` with sticky id
   `bot-install-<name>` (info → info → info → success).
 
-If the bot's `manifest.toml` declares a `[bot.source]` block, calling
-`update_bot_from_manifest(name)` re-runs the install using the recorded
-repo/glob. The previous `mjai_bot/<name>/` is removed first — settings
-and other bot-local files are not preserved.
+The `manifest.toml` `[bot.source]` block records the repo/glob an install
+came from; deleting the bot directory and reinstalling from the same source
+is the way to refresh it (settings and other bot-local files are not
+preserved).
 
 ## Installing from a local ZIP
 
@@ -420,11 +408,12 @@ target binaries exist.
 
 ### Bundling
 
-`tauri.conf.json` ships the tree via `bundle.resources = ["runtime/**/*"]`.
+`scripts/package-zip.sh` copies the `runtime/` tree next to the binary in
+the release zip; `src/bot/runtime.rs` finds it exe-adjacent at runtime.
 The `runtime/` directory is `.gitignore`'d (`runtime/*` with
 `!runtime/.gitkeep` exception) so the placeholder file keeps the glob
 non-empty even before `fetch-runtime.sh` runs. CI must re-run the
-script once per matrix target before `tauri build`.
+script once per matrix target before packaging.
 
 ## Why subprocess
 
@@ -441,8 +430,7 @@ couples Akagi's lifecycle to libriichi's.
 
 `BotConfig` stores two slots: `active_4p` and `active_3p`. `BotManager`
 picks the slot matching `start_game.num_players` (3 → `active_3p`, else
-`active_4p`). Empty slot ⇒ no runner spawned for that game (analysis
-still runs).
+`active_4p`). Empty slot ⇒ no runner spawned for that game.
 
 Frontend → backend: `set_active_bot(mode, name)` IPC command, where
 `mode` is `"4p"` or `"3p"` and `name` is the bot subdir name (or `""`
@@ -469,5 +457,5 @@ without the legacy field on the next persist.
 - Mortal weights. Users place `mortal.pth` inside their `mjai_bot/mortal/`
   folder; Akagi never ships, fetches, or configures weight paths. The
   bot script loads them itself.
-- HUD rendering. `BotResponse`s land on the broadcast bus; the HUD layer
-  is a downstream consumer added later.
+- Rendering. `BotResponse`s land on the broadcast bus; the overlay window
+  is the consumer that draws `meta.show` — nothing in this module renders.

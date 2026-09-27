@@ -23,9 +23,8 @@
 //! real-time analyzer: if the HUD falls behind, drop and resync rather
 //! than stall the proxy.
 
-use crate::analysis::result::AnalysisResult;
 use crate::bot::BotResponse;
-use crate::schema::{BotStatus, CaptureStatus, HistoryEvent, MjaiEvent, Notification};
+use crate::schema::{BotStatus, CaptureStatus, MjaiEvent, Notification};
 use tokio::sync::broadcast;
 
 /// Fan-out for `MjaiEvent`s from platform bridges.
@@ -42,10 +41,6 @@ pub type CaptureStatusBus = broadcast::Sender<CaptureStatus>;
 
 /// Fan-out for transient `Notification`s pushed at the user.
 pub type NotifyBus = broadcast::Sender<Notification>;
-
-/// Fan-out for `AnalysisResult`s produced after each game-state update.
-/// Producer: `analysis::runner`. Consumers: `ipc` forwarder, future HUD.
-pub type AnalysisBus = broadcast::Sender<AnalysisResult>;
 
 /// One `MjaiEvent` as re-emitted after the `GameTracker` applied it.
 ///
@@ -73,12 +68,6 @@ pub struct TrackedEvent {
 /// mirror being current when this fires (vs. the raw `MjaiBus` where
 /// ordering against the tracker is racy).
 pub type PostTrackerBus = broadcast::Sender<TrackedEvent>;
-
-/// Fan-out for game-history lifecycle events. Producer:
-/// `crate::history::recorder` (on each finalised game / deletion).
-/// Consumer: `ipc` forwarder, which emits `history-recorded` to the
-/// frontend.
-pub type HistoryBus = broadcast::Sender<HistoryEvent>;
 
 /// Default capacity. Live pacing produces ~1 second of mjai events at a time
 /// (start_kyoku + 13 tehai + a few tsumo/dahai pairs), which is tiny. The
@@ -122,17 +111,7 @@ pub fn notify_bus() -> NotifyBus {
     tx
 }
 
-pub fn analysis_bus() -> AnalysisBus {
-    let (tx, _rx) = broadcast::channel(DEFAULT_CAPACITY);
-    tx
-}
-
 pub fn post_tracker_bus() -> PostTrackerBus {
     let (tx, _rx) = broadcast::channel(DEFAULT_CAPACITY);
-    tx
-}
-
-pub fn history_bus() -> HistoryBus {
-    let (tx, _rx) = broadcast::channel(STATUS_CAPACITY);
     tx
 }

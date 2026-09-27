@@ -7,9 +7,8 @@
 //! mjai tile strings, fixed-size arrays where appropriate, and a small
 //! enum for `phase`.
 //!
-//! All types are `Serialize + Deserialize` so they can ride the future
-//! `GameStateBus` straight through to the frontend without further
-//! transform.
+//! All types are `Serialize + Deserialize` so consumers (autoplay, tests)
+//! can round-trip them without further transform.
 
 use std::collections::HashMap;
 
@@ -85,8 +84,7 @@ impl From<&Meld> for MeldSnapshot {
 }
 
 /// One entry in a player's discard pile. Carries the full per-tile signal we
-/// need for both rendering (mahgen `^`/`_`/`v` markers) and the analysis
-/// engine's tedashi tracking.
+/// need for rendering the river (tedashi / tsumogiri / riichi markers).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscardEntry {
     /// mjai tile string (e.g. `"5mr"`, `"P"`, `"3p"`).
@@ -97,8 +95,7 @@ pub struct DiscardEntry {
     pub is_riichi: bool,
     /// `true` if this discard was claimed by another player (pon/chi/kan) and
     /// has physically left the pond. **View-only**: the entry is kept in the
-    /// list so the analysis engine still counts it as genbutsu/furiten against
-    /// this seat; only the mahgen river encoder skips it. riichienv-core never
+    /// list; the river encoder skips it. riichienv-core never
     /// removes called tiles from its `discards`, so we reconstruct this flag
     /// from the melds in [`GameStateSnapshot::from_state`].
     #[serde(default)]
@@ -323,8 +320,7 @@ fn called_tiles_by_seat(all_melds: &[Vec<MeldSnapshot>], np: usize) -> Vec<HashM
 /// can pick the wrong copy when the same tile was discarded twice and only one
 /// was called — but the copies are visually identical, so the rendered river is
 /// unaffected and the hidden count is always exact. The flagged entries stay in
-/// the list (the analysis engine still treats them as genbutsu against this
-/// seat); only [`crate::game_state::mahgen_view`]'s river encoder skips them.
+/// the list; the river encoder skips them.
 fn build_river(
     discards: &[u8],
     from_hand: &[bool],

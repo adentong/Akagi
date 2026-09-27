@@ -62,10 +62,9 @@
 > 遊戲開發商與發行商保留對違反其服務條款者採取行動的權利；
 > 任何後果（如帳號停權等）皆由使用者自行承擔。
 
-Akagi 透過本機 Proxy 或內建瀏覽器監看你在雀魂 / 天鳳的對局，
-鏡射遊戲狀態，並在可拖曳的 HUD 中顯示 **向聽**、**待牌**、
-**和牌率**、**聽牌率**、**對各家放銃風險**，以及
-**推薦切牌**。執行檔本身就內建一個AI模型 —— 不需要安裝任何東西 ——
+Akagi 透過本機 Proxy 或內建瀏覽器監看你在雀魂 / 天鳳 / Riichi City 的對局，
+鏡射遊戲狀態，並在可拖曳的置頂浮動視窗中顯示 bot 的
+**排名切牌建議**。執行檔本身就內建一個 AI 模型 —— 不需要安裝任何東西 ——
 它的建議會在每巡顯示；若想要更強的託管模型，可以把它指向
 雲端推論 API。
 
@@ -86,8 +85,7 @@ https://github.com/user-attachments/assets/2ce7cb71-8b25-4895-a12b-0a638665dcab
 - [支援的平台](#支援的平台)
 - [快速開始](#快速開始)
 - [Bots](#bots)
-- [對局歷史](#對局歷史)
-- [紀錄與診斷](#紀錄與診斷)
+- [紀錄](#紀錄)
 - [下載鏡像](#下載鏡像)
 - [疑難排解](#疑難排解)
 - [Roadmap](#roadmap)
@@ -108,8 +106,12 @@ https://github.com/user-attachments/assets/2ce7cb71-8b25-4895-a12b-0a638665dcab
 
 ## 功能
 
-- **即時 HUD** — 向聽、待牌、和牌率、聽牌率、對各家放銃
-  風險、推薦的進攻 / 防守切牌。可拖曳、可縮放的UI佈局。
+- **建議浮動視窗** — bot 的排名前 N 切牌建議，顯示在一個無邊框、
+  可拖到任意位置的置頂視窗裡，覆蓋在遊戲之上。透明度與行數
+  可設定；可在 Overview 頁籤開關。
+- **全自動對局** — 在 Riichi City 上，Akagi 可以連續排隊段位對局
+  並透過 proxy 連線直接打完整場（切牌、鳴牌、立直）。雀魂與
+  天鳳則透過 Chromium 抓包 backend 自身的輸入通道驅動。
 - **兩種抓包模式**
   - **MITM proxy**（預設） — 系統層級；需一次性的 CA 信任。
   - **Chromium** — 由 Akagi 啟動受控的 Chromium 系列瀏覽器，
@@ -124,16 +126,11 @@ https://github.com/user-attachments/assets/2ce7cb71-8b25-4895-a12b-0a638665dcab
 
   兩者皆可依模式切換：`bot.active_4p` 與 `bot.active_3p`
   會依牌桌人數自動套用。
-- **對局歷史** — 每場結束的對局會自動記錄。歷史頁籤顯示
-  名次圓餅圖、可選計分規則的累積 PT 折線圖（雀魂段位 /
-  天鳳段位 / 自訂 uma），以及細部統計（和牌率、放銃率、
-  立直率、副露率、流局率、平均和牌 / 放銃點數、平均和牌
-  巡目、役滿 / 流局滿貫次數）。
 - **簡單的首次啟動設定** — 語言 → 平台 → 抓包模式 →
   CA 信任 / Chromium 選擇 → bot 設定 → 完成。
 - **多語系** — English、日本語、繁體中文、简体中文。
   可在設定精靈或設定即時切換。
-- **三麻** — 完整支援：AI分析、依模式 bot 路由、歷史統計、3p uma 表。
+- **三麻（三人麻將）** — 完整支援：依模式的 bot 路由，以及貫穿整條流程的三麻對局處理。
 - **應用程式內更新** — 啟動時自動檢查新版本，也可在 *設定 → 更新*
   手動檢查；一鍵下載、原地更新並重新啟動。
 
@@ -143,7 +140,7 @@ https://github.com/user-attachments/assets/2ce7cb71-8b25-4895-a12b-0a638665dcab
 |---|:---:|:---:|:---:|
 | **雀魂（Mahjong Soul / Majsoul）** | &check; | &check; | &check; |
 | **天鳳（Tenhou）** | &check; | &check; | &check; |
-| **Riichi City** | &check; | &check; | &cross; |
+| **Riichi City** | &check; | &check; | &check; |
 | **Amatsuki** | （規劃中） | （規劃中） | &cross; |
 
 ---
@@ -156,7 +153,7 @@ Akagi 以 portable zip 發佈 — 每個平台一個自帶所需檔案的資料�
 從 [Releases](https://github.com/shinkuan/Akagi/releases) 下載
 對應作業系統的 zip,解壓縮到任何你有寫入權限的位置(例如
 `~/Apps/`、桌面),然後直接執行裡面的`akagi`即可。設定檔、紀錄、
-歷史對局、CA 憑證以及 bot 都會建立在旁邊,所以搬移 /
+CA 憑證以及 bot 都會建立在旁邊,所以搬移 /
 備份 / 解除安裝就只是搬移 / 複製 / 刪除整個資料夾。
 
 | OS | 檔案 | 備註 |
@@ -241,82 +238,24 @@ Akagi 內建一個 **純 Rust 的 bot**，它是兩種模式的預設值（`bot.
 
 ---
 
-## 對局歷史
-
-每一場乾淨結束的對局（產生了 `end_game` mjai 事件）都會
-被持久化到 `<config_root>/history/`：
-
-```
-<config_root>/history/
-├── index.jsonl              # 每行一筆 GameRecord（以 ULID 為 key）
-└── games/
-    └── <ulid>.mjai.jsonl    # 完整事件流的副本
-```
-
-中途斷線會在 buffer 中留下未完成的紀錄並被靜默丟棄 —
-只有完整對局會落到磁碟。
-
-前端 **History** 頁籤顯示：
-
-- **名次圓餅圖** — 1/2/3/4 名分布（三麻只有 3 片）。
-- **累積 PT 折線圖** — 可選擇計分規則：
-  - **雀魂**：選擇 `場次`（銅 / 銀 / 金 / 玉 / 王座）與
-    `段位`（初心 1 星 → 魂天）。
-  - **天鳳**：選擇 `段位`（新人 → 天鳳位，共 21 階）。
-  - **自訂**：直接編輯 uma 與段位獎金陣列。
-  切換規則 / 段位會立即重繪 — 不需要 backend round-trip。
-- **細部統計** — 和牌率、放銃率、立直率、副露率、
-  流局率、平均和牌 / 放銃點數、平均和牌巡目、
-  役滿 / 流局滿貫次數。
-- **對局清單** — 可依平台 / 人數 / 東風或半莊 / 日期過濾。
-  點選列即可看到最終排名與該局統計；垃圾桶圖示會同時
-  刪除 index 條目與該局的 `.mjai.jsonl`。
-
-PT 規則與過濾條件會持久化於 `localStorage`。Bridge 啟動
-時從 backend 載入紀錄，並透過 `history-recorded` Tauri
-事件保持同步。
-
-數學細節、儲存 schema，以及如何新增平台 / 統計欄位 /
-過濾維度請見 [`src/history/README.md`](./src/history/README.md)。
-
----
-
-## 紀錄與診斷
+## 紀錄
 
 每次 session 的紀錄會落在 `<log_dir>/<YYYYMMDD-HHMMSS>/`：
 
 ```
 <log_dir>/<session>/
-├── all.log                       # 所有 tracing 輸出彙整
-├── <target>.log                  # 依模組過濾的紀錄
+├── all.jsonl                     # 每一條 tracing 事件，每行一個 JSON 物件
+├── all.log                       # 同一股流的緊湊文字形式
+├── <target>.log                  # 依模組過濾的紀錄（proxy、bot）
 ├── proxy.binlog                  # 原始 WS 二進位訊框
 ├── majsoul/<flow_id>.log         # 每條 WebSocket flow 的 JSON 紀錄
-├── majsoul/<flow_id>.mjai.jsonl  # 每場對局的 mjai 事件流
-└── inspector.jsonl               # Inspector 看到的訊框
+├── majsoul/<ts>.mjai.jsonl       # 每場對局的 mjai 事件流
+└── inspector.jsonl               # 訊框 / mjai 事件 / bot 反應
 ```
 
-前端 **Logs** 路由有兩個頁籤：
-
-### Diagnostic
-
-可過濾的應用程式紀錄。可依等級（trace / debug / info /
-warn / error）與模組過濾。可即時 tail 或瀏覽過去的
-session；點選列可看到原始結構化欄位與來源位置。
-**Open Folder** 按鈕會在系統檔案管理員中開啟該 session
-資料夾。
-
-### Inspector
-
-協定層級的訊框檢視器。共三類條目：
-
-- **WS Frame** — 原始二進位（base64 截短）加上 bridge
-  的初步解析結果。
-- **MjaiEvent** — 流向 bot 的解碼後事件。
-- **BotReaction** — bot 的回應，含 `meta` 欄位
-  （信心度 / q-values / bot 想送出的任何資訊）。
-
-訊框計數會顯示每個 WS 訊框產生了多少個 mjai 事件，
-在排查 bot 或 bridge 問題時很有用。
+應用程式內沒有日誌檢視器：這些檔案就是介面。為一次 session
+除錯所需的一切 —— 應用程式紀錄、原始訊框、解碼後的 mjai 事件與
+bot 反應 —— 都在那個資料夾裡。
 
 ---
 
@@ -370,8 +309,8 @@ minisign -Vm akagi-<version>-<platform>.zip -p minisign.pub
   `capture.chromium.executable`。如果瀏覽器有啟動但沒
   訊框流入，檢查 `--remote-debugging-port` 是否被其他
   擴充功能擋下。
-- **Bot 對局途中崩潰。** Inspector 頁籤可顯示 bot 死前
-  看到的最後一個訊框；附在 bug 報告裡。
+- **Bot 對局途中崩潰。** 該 session 的 `inspector.jsonl` 裡有
+  bot 死前看到的最後一個訊框；把它附在 bug 報告裡。
 - **三麻挑了錯的 bot。** 檢查設定 → Bot 中的
   `bot.active_3p` — 它與 `bot.active_4p` 互相獨立。
 - **更新 / bot 安裝 / Chrome 下載逾時（中國大陸等）。**
@@ -389,21 +328,18 @@ minisign -Vm akagi-<version>-<platform>.zip -p minisign.pub
 alpha.8 已完成：
 
 - [x] 三麻 — 完整流程
-- [x] 天鳳 bridge（僅觀戰）
-- [x] Riichi City bridge（僅 MITM — 原生用戶端；僅觀戰）
-- [x] 對局歷史持久化 + History 頁籤（名次圓餅 / PT 圖 / 統計）
-- [x] 紀錄檢視（Diagnostic + Inspector）
+- [x] 天鳳 bridge
+- [x] Riichi City bridge（僅 MITM — 原生用戶端）
 - [x] i18n：en / ja / zh-TW / zh-CN，含設定精靈語言選擇
 - [x] 從 GitHub release 或本機 ZIP 檔案安裝 bot
 - [x] Chromium 抓包模式（不需信任 CA）
 - [x] **自訂主題**（前端 theming hook）
-- [x] **AutoPlay**（支援雀魂與天鳳；由 bot 自主控制牌桌）
+- [x] **AutoPlay**（雀魂、天鳳與 Riichi City；由 bot 自主控制牌桌）
 
 規劃中：
 
 - [ ] **Amatsuki** 平台支援
-- [ ] **前端打磨** — 牌型佈局、動畫、無障礙
-- [ ] **天鳳 autoplay**
+- [ ] **前端打磨** — 動畫、無障礙
 
 詳細的 bug 追蹤請至
 [GitHub Issues](https://github.com/shinkuan/Akagi/issues)。
@@ -431,20 +367,19 @@ alpha.8 已完成：
        ▼                  ▼                  ▼
   game_state::tracker   bot::manager     ipc forwarder
        │                  │                  │
-       ▼ PostBus          ▼ BotResponseBus   ▼ app.emit
-  analysis::runner   內建 NN（行程內）    Tauri webview
-       │             | 雲端 API
-       ▼ AnalysisBus  | mjai 子行程
-       └──► ipc forwarder ──► app.emit
+       ▼ PostTrackerBus   ▼ BotResponseBus   ▼ app.emit
+  autoplay::manager   內建 NN（行程內）    Tauri webview
+                      | 雲端 API
+                      | mjai 子行程
 ```
 
 [`src/lib.rs`](./src/lib.rs) 在啟動時把這些 bus 接起來。
 前端透過 push 事件（`mjai-event`、`bot-response`、
 `bot-status`…）與 pull 指令和 backend 溝通，兩者的清單
 都在 [`src/ipc/README.md`](./src/ipc/README.md)。開啟
-AutoPlay 時，`autoplay` manager 會取用 bot 的決策，並透過
-Chromium 抓包 backend（CDP）執行：雀魂是在牌桌上點擊，天鳳的
-客戶端協定夠單純，則直接透過對局連線送出動作。
+AutoPlay 時，`autoplay` manager 會取用 bot 的決策，並在真實的
+遊戲客戶端上執行：雀魂與天鳳透過 Chromium 抓包 backend 自身的
+輸入通道點擊操作，Riichi City 則透過 MITM proxy 注入協定訊框。
 
 ## 技術堆疊
 
@@ -461,7 +396,6 @@ Chromium 抓包 backend（CDP）執行：雀魂是在牌桌上點擊，天鳳的
 | 前端 | [React](https://react.dev) 19、TypeScript、[Vite](https://vitejs.dev) 8 |
 | 樣式 | [Tailwind CSS](https://tailwindcss.com) v4、[shadcn/ui](https://ui.shadcn.com)（Radix Nova preset） |
 | 狀態 | [Zustand](https://github.com/pmndrs/zustand) |
-| 圖表 | [Recharts](https://recharts.org) |
 | 牌型渲染 | [`<mah-gen>`](https://github.com/eric200203/mahgen) Web Component |
 | i18n | [react-i18next](https://react.i18next.com) |
 | mjai bot 執行環境 | `python-build-standalone` 3.12 + [`uv`](https://github.com/astral-sh/uv)（依平台打包；僅外掛 bot 需要 —— 內建 bot 完全用不到） |
@@ -471,19 +405,17 @@ Chromium 抓包 backend（CDP）執行：雀魂是在牌桌上點擊，天鳳的
 ```
 .
 ├── src/
-│   ├── analysis/      向聽 / 待牌 / 和牌率 / 風險 / 切牌搜尋
-│   ├── autoplay/      bot 決策 → 點擊牌桌（雀魂）或送出協定 frame（天鳳），皆走 CDP
+│   ├── autoplay/      bot 決策 → 在牌桌點擊（雀魂 / 天鳳，經 CDP）或注入協定 frame（Riichi City）
 │   ├── bot/           Bot manager：內建 bot、雲端 API client、mjai 子行程執行器
 │   ├── bridge/        各平台協定 → MjaiEvent
 │   │   ├── majsoul/   雀魂（liqi protobuf）
 │   │   ├── riichi_city/  Riichi City（僅 MITM）
-│   │   └── tenhou/    天鳳（JSON tag stream，僅觀戰）
+│   │   └── tenhou/    天鳳（JSON tag stream）
 │   ├── capture/       抓包 backend 抽象（mitm | chromium）
 │   ├── config/        AppConfig（TOML）區段與解析
 │   ├── event_bus.rs   子系統間的 broadcast channel
-│   ├── game_state/    riichienv 驅動的鏡射、snapshot、mahgen view
+│   ├── game_state/    riichienv 驅動的鏡射 + snapshot
 │   ├── github/        GitHub Releases client（bot 安裝、自我更新）
-│   ├── history/       對局回放儲存與索引
 │   ├── inspector/     訊框 / 事件 / bot reaction broadcaster
 │   ├── ipc/           Tauri 指令、app state、capture supervisor
 │   ├── logger/        每 session 紀錄目錄與每 target 檔案 appender
@@ -496,9 +428,8 @@ Chromium 抓包 backend（CDP）執行：雀魂是在牌桌上點擊，天鳳的
 │   └── example/       in-tree 規則型向聽優化器
 ├── frontend/          React + Vite + Tailwind + shadcn UI
 │   └── src/
-│       ├── routes/    Overview / GameDashboard / Bots / History / Logs / Settings / Setup / InspectorView / DiagnosticView
-│       ├── tiles/     儀表板磚塊（header、hands、opponents、analysis…）
-│       ├── stores/    Zustand store，一個領域一個（game、bot、config、theme…）
+│       ├── routes/    Overview / Bots / Settings / Setup（+ 浮動視窗）
+│       ├── stores/    Zustand store，一個領域一個（bot、capture、config、theme…）
 │       └── i18n/      en / ja / zh-TW / zh-CN
 ├── tests/             整合測試
 ├── capabilities/      Tauri 權限
@@ -610,15 +541,17 @@ binary 旁邊;`src/bot/runtime.rs` 在執行時會用 exe-adjacent
 
 | 檔案 | 涵蓋範圍 |
 |---|---|
-| `analysis_pipeline.rs` | 端到端分析（事件 → 向聽 → 切牌建議） |
-| `analysis_bench.rs` | hot path 效能 |
 | `bot_lifecycle.rs` | 安裝 → sync → spawn → 來回通訊 |
 | `example_bot.rs` | 規則型參考 bot 跑合成對局 |
-| `mortal_zip_layout.rs` | 驗證 Mortal release zip 結構 |
+| `tenhou_reconnect.rs` | 對局中途重連處理（座位 / 手牌復原） |
+| `proxy_http_capture*.rs` | HTTP 抓包、配對與 record-all 策略 |
+| `proxy_loopback_connect.rs` | 拒絕 loopback CONNECT |
+| `proxy_cert_report_rewrite.rs` | 憑證報告重寫 |
+| `proxy_telemetry_block.rs` | 遙測信標阻擋 |
+| `pr_build_workflow.rs` | PR-build workflow 不變式 |
 
 ```bash
 cargo test               # 所有測試（含整合測試）
-cargo test --release     # 用於效能 bench
 ```
 
 ## Releases 與 CI
@@ -652,10 +585,9 @@ Tag 必須位於 `v3` 分支。
 | 來源 | 應用於 | 用途 |
 |---|---|---|
 | [mjai JSONL 規格（Gimite）](https://gimite.net/pukiwiki/index.php?Mjai%20%E9%BA%BB%E9%9B%80AI%E5%AF%BE%E6%88%A6%E3%82%B5%E3%83%BC%E3%83%90) | `src/schema/mjai/` | `MjaiEvent` enum 與 bot wire 協議 — 15 種事件、tile-string 格式、狀態機規則。 |
-| [`EndlessCheng/mahjong-helper`](https://github.com/EndlessCheng/mahjong-helper)（Go 分析 CLI） | `src/analysis/` | `util/` 的直接 Rust 移植 — 向聽、待牌、和牌率、聽牌率、風險模型、切牌搜尋。 |
 | [`Xerxes-2/MajsoulMax-rs`](https://github.com/Xerxes-2/MajsoulMax-rs)（Rust MITM proxy，**GPL-3.0**） | `src/proxy/handler.rs`、`src/bridge/majsoul/parser.rs`、`src/bridge/majsoul/proto/liqi.proto` | 雀魂 5 層 WS wire 格式參考（type byte → Wrapper → 內層訊息 → action protobuf）。**僅參考格式 — 未複製程式碼。** |
-| [`smly/RiichiEnv`](https://github.com/smly/RiichiEnv)（Rust RL env + Python bindings） | `Cargo.toml`（`riichienv-core` 相依）、`src/analysis/`、`src/game_state/` | 牌 / 手牌 / 向聽 / 役 / 計分原語 + 遊戲狀態模型。分析引擎與 game tracker 都建構在它之上。 |
-| [`eric200203/mahgen`](https://github.com/eric200203/mahgen)（麻將牌渲染 DSL） | `src/game_state/mahgen_view.rs`、前端 `<mah-gen>` | DSL 語法，用於後端預先編碼手牌 / 副露 / 河字串。 |
+| [`smly/RiichiEnv`](https://github.com/smly/RiichiEnv)（Rust RL env + Python bindings） | `Cargo.toml`（`riichienv-core` 相依）、`src/game_state/` | 牌 / 手牌 / 向聽 / 役 / 計分原語 + 遊戲狀態模型。tracker 與 autoplay 都建構在它之上。 |
+| [`eric200203/mahgen`](https://github.com/eric200203/mahgen)（麻將牌渲染 DSL） | 前端 `<mah-gen>` + `lib/mahgenRegistry.ts` | DSL 語法，用於在浮動視窗中渲染牌序。 |
 | [`smly/mjai.app`](https://github.com/smly/mjai.app)（麻將 AI 競賽平台） | `mjai_bot/`、`src/bot/` | bot 子行程慣例 — JSONL stdin/stdout、argv `python bot.py <player_id>`、`AKAGI_PLAYER_ID` 環境變數、批次結尾 flush 點。 |
 | [`shinkuan/Akagi`](https://github.com/shinkuan/Akagi)（原版 Akagi，Python） | 架構 / 行為對齊 | 我們所重現的原始功能集：MITM proxy、mjai bridge、可插拔 bot、推薦 HUD。 |
 
@@ -668,7 +600,6 @@ Copyright 2026 Shinkuan。第三方致謝資訊位於
 
 **內附 / 連結原始碼**
 
-- **mahjong-helper**（MIT） — `src/analysis/` 為 `util/` 的 Rust 移植。
 - **riichienv-core** / RiichiEnv（Apache-2.0） — Cargo 相依。
 - **mahgen**（MIT） — DSL + `<mah-gen>` custom element。
 

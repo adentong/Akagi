@@ -14,31 +14,11 @@
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
-use crate::schema::history::MatchInfo;
-
 /// mjai tile string. Examples: `"1m"`, `"5mr"` (red 5), `"E"`, `"P"`, `"?"`.
 pub type Tile = String;
 
 /// Seat index, 0..=3 (4p) or 0..=2 (3p).
 pub type Actor = u8;
-
-/// In-process game metadata kept inside Akagi's typed event bus. These fields
-/// are deliberately excluded from mjai JSON so subprocess bots, logs and the
-/// cloud inference API continue to receive the standard protocol shape.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GameMeta {
-    /// Stable hash of `ReqAuthGame.game_uuid` (Majsoul) — the reconnect key
-    /// the history recorder dedups on. The raw UUID itself travels
-    /// separately in `match_info` (persisted to the local history index,
-    /// never uploaded).
-    pub game_id: Option<u64>,
-    /// `game_config.mode.mode` (Majsoul): 1/2 = 4p East / East-South,
-    /// 11/12 = 3p East / East-South.
-    pub match_mode: Option<u8>,
-    /// Persisted match identity (rank room, game/paifu id) copied into
-    /// `GameRecord.match_info` by the history aggregator.
-    pub match_info: Option<MatchInfo>,
-}
 
 /// Why an in-process game-end event was emitted. The reason and standings are
 /// private metadata; every variant still serializes as `{"type":"end_game"}`.
@@ -76,8 +56,6 @@ pub enum MjaiEvent {
         /// deserialization of pre-3p log lines.
         #[serde(default = "default_num_players")]
         num_players: u8,
-        #[serde(skip, default)]
-        game_meta: Option<GameMeta>,
     },
     StartKyoku {
         bakaze: Tile,
@@ -390,27 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn private_game_metadata_never_changes_mjai_json() {
-        let start = MjaiEvent::StartGame {
-            names: vec!["a".into(), "b".into(), "c".into(), "d".into()],
-            kyoku_first: None,
-            aka_flag: None,
-            id: Some(0),
-            num_players: 4,
-            game_meta: Some(GameMeta {
-                game_id: Some(7),
-                match_mode: Some(2),
-                match_info: Some(MatchInfo::Majsoul {
-                    game_uuid: Some("240101-uuid".into()),
-                    mode_id: Some(12),
-                    room_id: None,
-                    contest_uid: None,
-                }),
-            }),
-        };
-        let start_json = serde_json::to_value(start).unwrap();
-        assert!(start_json.get("game_meta").is_none());
-
+    fn end_game_confirmed_serializes_minimal() {
         let end = MjaiEvent::confirmed_game(
             Some(vec![12000, 41000, 27000, 20000]),
             Some(vec![4, 1, 2, 3]),

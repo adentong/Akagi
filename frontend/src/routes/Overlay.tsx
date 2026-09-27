@@ -82,7 +82,7 @@ export function Overlay() {
           className="flex shrink-0 items-center gap-1 px-2 pt-1.5 pb-1"
         >
           <span className="flex-1 truncate text-[11px] font-medium text-muted-foreground">
-            {show?.title ?? t('tile.bot_show_default_title')}
+            {show?.title ?? t('overlay.default_title')}
           </span>
           <button
             type="button"
